@@ -60,24 +60,46 @@ cd rsbench
 cargo build --release
 ```
 
-### Quick Configuration
+### Quick Start
 
-Copy and customize the default configuration:
+RSBench separates infrastructure configuration from test scenarios:
+
+**1. Configure your database connection once:**
 
 ```bash
-# Copy the default config as a starting point
-cp rsbench.default.yaml my_benchmark.yaml
-
-# Edit to match your database and requirements
-vim my_benchmark.yaml
-
-# Run the benchmark
-./target/release/rsbench --config my_benchmark.yaml
+# Edit the default config for your database
+vim config/rsbench.config.yaml
 ```
 
-The `rsbench.default.yaml` file contains all available options with detailed comments and examples.
+**2. Run test scenarios:**
 
-<!-- Detailed documentation coming soon -->
+```bash
+# Quick smoke test
+./target/release/rsbench --scenario scenarios/smoke_test.yaml
+
+# OLTP read/write test
+./target/release/rsbench --scenario scenarios/oltp_read_write.yaml
+
+# Capacity test (finds limits)
+./target/release/rsbench --scenario scenarios/capacity_test.yaml
+```
+
+**3. Test against different environments:**
+
+```bash
+# Development (default)
+rsbench --scenario scenarios/oltp_read_write.yaml
+
+# Staging
+rsbench --config config/rsbench.config.staging.yaml --scenario scenarios/oltp_read_write.yaml
+
+# Production (read replica, conservative)
+rsbench --config config/rsbench.config.prod.yaml --scenario scenarios/smoke_test.yaml
+```
+
+See `config/README.md` and `scenarios/README.md` for detailed documentation.
+
+<!-- Detailed API documentation coming soon -->
 
 ## Architecture
 

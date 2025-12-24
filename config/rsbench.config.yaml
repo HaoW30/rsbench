@@ -1,0 +1,71 @@
+# RSBench Infrastructure Configuration
+#
+# This file defines database connection, runtime settings, and infrastructure.
+# Set once per environment and reuse across all test scenarios.
+#
+# Usage:
+#   rsbench --config config/rsbench.config.yaml --scenario scenarios/my_test.yaml
+#   rsbench --scenario scenarios/my_test.yaml  # Uses this file by default
+
+# ============================================================================
+# Database Configuration
+# ============================================================================
+database:
+  # Database driver to use
+  # Options: "mysql", "postgres" (when feature is enabled)
+  driver: mysql
+
+  # Connection string for the database
+  # Format depends on the driver:
+  #   MySQL:    mysql://user:password@host:port/database
+  #   Postgres: postgresql://user:password@host:port/database
+  connection_string: "mysql://root:password@localhost:3306/sbtest"
+
+  # Connection pool configuration
+  pool:
+    # Minimum number of connections to maintain in the pool
+    min_size: 10
+
+    # Maximum number of connections in the pool
+    max_size: 100
+
+    # Timeout for establishing a new connection
+    connection_timeout: 10s
+
+    # Maximum time a connection can remain idle before being closed
+    idle_timeout: 300s
+
+# ============================================================================
+# Runtime Configuration
+# ============================================================================
+runtime:
+  # Runtime execution mode
+  # Options: "async" (recommended) or "blocking" (sysbench compatibility)
+  type: async
+
+  # Number of worker threads for async runtime
+  # Default: number of CPU cores
+  workers: 4
+
+  # Maximum number of concurrent database connections
+  # Note: Should not exceed database max_connections
+  max_connections: 100
+
+  # Backpressure threshold (0.0 to 1.0)
+  # When pool utilization exceeds this, backpressure events are recorded
+  # Higher values = more aggressive before reporting backpressure
+  backpressure_threshold: 0.8
+
+# ============================================================================
+# Output Configuration
+# ============================================================================
+output:
+  # Output format: "text" or "json"
+  # text: Human-readable, sysbench-compatible format
+  # json: Structured output for parsing/analysis
+  format: json
+
+  # Output file path (optional)
+  # If not specified, results are written to stdout
+  # Can be overridden per scenario
+  file: null

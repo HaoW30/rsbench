@@ -1,0 +1,26 @@
+# High Throughput Test Scenario
+#
+# Tests database performance at high request rates.
+# Used to find maximum sustainable throughput.
+
+scenario:
+  executor:
+    type: constant-rate
+    rate: 10000         # 10K ops/sec
+    duration: 300s      # 5 minutes
+    max_connections: 200
+
+  workload:
+    type: builtin
+    name: oltp_read_write
+    table_count: 20
+    table_size: 100000
+
+determinism:
+  seed: 42
+  strict_mode: false
+
+# Override output for this specific test
+output:
+  format: json
+  file: results/high_throughput_{timestamp}.json

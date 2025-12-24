@@ -1,0 +1,25 @@
+# RSBench Infrastructure Configuration - Staging Environment
+#
+# Staging-specific database and runtime settings.
+#
+# Usage:
+#   rsbench --config config/rsbench.config.staging.yaml --scenario scenarios/my_test.yaml
+
+database:
+  driver: mysql
+  connection_string: "mysql://benchuser:staging_pass@staging-db.example.com:3306/sbtest"
+  pool:
+    min_size: 20
+    max_size: 200
+    connection_timeout: 10s
+    idle_timeout: 300s
+
+runtime:
+  type: async
+  workers: 8
+  max_connections: 200
+  backpressure_threshold: 0.8
+
+output:
+  format: json
+  file: results/staging_{timestamp}.json

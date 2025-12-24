@@ -1,0 +1,39 @@
+# OLTP Read/Write Test Scenario
+#
+# Balanced workload with 60% reads and 40% writes.
+# Typical OLTP application pattern.
+#
+# Usage:
+#   rsbench --scenario scenarios/oltp_read_write.yaml
+#   rsbench --config config/staging.yaml --scenario scenarios/oltp_read_write.yaml
+
+# Optional: Override default infrastructure config
+# config: config/rsbench.config.staging.yaml
+
+# ============================================================================
+# Test Scenario Definition
+# ============================================================================
+scenario:
+  # Executor: How to apply load
+  executor:
+    type: constant-rate
+    rate: 1000          # 1000 operations per second
+    duration: 60s       # Run for 60 seconds
+    max_connections: 50
+
+  # Workload: What operations to execute
+  workload:
+    type: builtin
+    name: oltp_read_write
+    table_count: 10
+    table_size: 10000
+
+# Determinism settings (optional)
+determinism:
+  seed: 42
+  strict_mode: false
+
+# Optional: Override output settings for this scenario
+# output:
+#   format: json
+#   file: results/oltp_read_write.json

@@ -12,12 +12,54 @@ use crate::{Error, Result};
 pub struct ConfigLoader;
 
 impl ConfigLoader {
-    /// Load configuration from various sources
+    /// Load configuration from various sources (legacy: combined config)
     pub fn load(source: ConfigSource) -> Result<ToolConfig> {
         match source {
             ConfigSource::File(path) => Self::load_from_file(&path),
             ConfigSource::Yaml(content) => Self::load_from_yaml(&content),
             ConfigSource::CliArgs(args) => Self::load_from_cli(args),
+        }
+    }
+
+    /// Load infrastructure configuration (database, runtime, output)
+    pub fn load_infrastructure(source: ConfigSource) -> Result<InfrastructureConfig> {
+        match source {
+            ConfigSource::File(path) => {
+                let content = std::fs::read_to_string(path)?;
+                Self::load_infrastructure_from_yaml(&content)
+            }
+            ConfigSource::Yaml(content) => Self::load_infrastructure_from_yaml(&content),
+            ConfigSource::CliArgs(_) => {
+                Err(Error::Config("Infrastructure config from CLI not supported".into()))
+            }
+        }
+    }
+
+    /// Load scenario file (may reference infrastructure config)
+    pub fn load_scenario_file(source: ConfigSource) -> Result<ScenarioFile> {
+        match source {
+            ConfigSource::File(path) => {
+                let content = std::fs::read_to_string(path)?;
+                Self::load_scenario_from_yaml(&content)
+            }
+            ConfigSource::Yaml(content) => Self::load_scenario_from_yaml(&content),
+            ConfigSource::CliArgs(_) => {
+                Err(Error::Config("Scenario from CLI not supported".into()))
+            }
+        }
+    }
+
+    /// Merge infrastructure and scenario into complete config
+    pub fn merge_infrastructure_and_scenario(
+        infra: InfrastructureConfig,
+        scenario_file: ScenarioFile,
+    ) -> ToolConfig {
+        ToolConfig {
+            database: infra.database,
+            runtime: infra.runtime,
+            scenario: scenario_file.scenario,
+            determinism: scenario_file.determinism.unwrap_or_default(),
+            output: scenario_file.output.unwrap_or(infra.output),
         }
     }
 
@@ -53,6 +95,16 @@ impl ConfigLoader {
             .map_err(|e| Error::Config(format!("YAML parse error: {}", e)))
     }
 
+    fn load_infrastructure_from_yaml(content: &str) -> Result<InfrastructureConfig> {
+        serde_yaml::from_str(content)
+            .map_err(|e| Error::Config(format!("Infrastructure config parse error: {}", e)))
+    }
+
+    fn load_scenario_from_yaml(content: &str) -> Result<ScenarioFile> {
+        serde_yaml::from_str(content)
+            .map_err(|e| Error::Config(format!("Scenario file parse error: {}", e)))
+    }
+
     fn load_from_cli(_args: CliArgs) -> Result<ToolConfig> {
         // TODO: Build config from CLI args
         Err(Error::Config("CLI-only config not yet implemented".into()))
@@ -69,7 +121,37 @@ pub enum ConfigSource {
     CliArgs(CliArgs),
 }
 
+/// Infrastructure configuration (database, runtime, output)
+/// This is configured once per environment and reused across tests
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct InfrastructureConfig {
+    pub database: DatabaseConfig,
+    pub runtime: RuntimeConfig,
+    pub output: OutputConfig,
+}
+
+/// Scenario file structure (can optionally reference infrastructure config)
+/// This defines the test workload and parameters
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct ScenarioFile {
+    /// Optional reference to infrastructure config file
+    /// If not specified, user must provide via CLI --config flag
+    #[serde(default)]
+    pub config: Option<PathBuf>,
+
+    /// Test scenario definition
+    pub scenario: ScenarioConfig,
+
+    /// Determinism settings (optional, uses defaults if not specified)
+    #[serde(default)]
+    pub determinism: Option<DeterminismConfig>,
+
+    /// Output settings (optional, uses infrastructure config if not specified)
+    pub output: Option<OutputConfig>,
+}
+
 /// Root configuration structure (M0 simplified)
+/// This is the complete merged config used at runtime
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct ToolConfig {
     pub database: DatabaseConfig,
@@ -524,5 +606,126 @@ output:
         let config = result.unwrap();
         assert_eq!(config.database.driver, "mysql");
         assert_eq!(config.determinism.seed, 42);
+    }
+
+    #[test]
+    fn test_load_infrastructure_config() {
+        // Test loading infrastructure config from config/ directory
+        let yaml = std::fs::read_to_string("config/rsbench.config.yaml");
+        if yaml.is_err() {
+            // Skip test if file doesn't exist
+            return;
+        }
+
+        let result = ConfigLoader::load_infrastructure(ConfigSource::Yaml(yaml.unwrap()));
+        assert!(result.is_ok(), "Infrastructure config should parse correctly");
+
+        let config = result.unwrap();
+        assert_eq!(config.database.driver, "mysql");
+        assert!(matches!(config.runtime.mode, RuntimeMode::Async { .. }));
+    }
+
+    #[test]
+    fn test_load_scenario_file() {
+        // Test loading scenario file from scenarios/ directory
+        let yaml = std::fs::read_to_string("scenarios/smoke_test.yaml");
+        if yaml.is_err() {
+            // Skip test if file doesn't exist
+            return;
+        }
+
+        let result = ConfigLoader::load_scenario_file(ConfigSource::Yaml(yaml.unwrap()));
+        assert!(result.is_ok(), "Scenario file should parse correctly");
+
+        let scenario_file = result.unwrap();
+        assert!(matches!(
+            scenario_file.scenario.executor,
+            ExecutorConfig::ConstantRate { .. }
+        ));
+        assert!(matches!(
+            scenario_file.scenario.workload,
+            WorkloadConfig::Builtin { .. }
+        ));
+    }
+
+    #[test]
+    fn test_merge_infrastructure_and_scenario() {
+        // Test merging infrastructure and scenario into complete config
+        let infra_yaml = std::fs::read_to_string("config/rsbench.config.yaml");
+        let scenario_yaml = std::fs::read_to_string("scenarios/smoke_test.yaml");
+
+        if infra_yaml.is_err() || scenario_yaml.is_err() {
+            // Skip test if files don't exist
+            return;
+        }
+
+        let infra = ConfigLoader::load_infrastructure(
+            ConfigSource::Yaml(infra_yaml.unwrap())
+        ).unwrap();
+
+        let scenario_file = ConfigLoader::load_scenario_file(
+            ConfigSource::Yaml(scenario_yaml.unwrap())
+        ).unwrap();
+
+        let merged = ConfigLoader::merge_infrastructure_and_scenario(infra, scenario_file);
+
+        assert_eq!(merged.database.driver, "mysql");
+        assert!(matches!(merged.runtime.mode, RuntimeMode::Async { .. }));
+        assert!(matches!(
+            merged.scenario.executor,
+            ExecutorConfig::ConstantRate { .. }
+        ));
+        assert_eq!(merged.determinism.seed, 42);
+    }
+
+    #[test]
+    fn test_all_scenario_files_parse() {
+        // Test that all scenario files in scenarios/ directory parse correctly
+        let scenario_files = [
+            "scenarios/smoke_test.yaml",
+            "scenarios/oltp_read_write.yaml",
+            "scenarios/high_throughput.yaml",
+            "scenarios/capacity_test.yaml",
+        ];
+
+        for file in &scenario_files {
+            let yaml = std::fs::read_to_string(file);
+            if yaml.is_err() {
+                continue; // Skip if file doesn't exist
+            }
+
+            let result = ConfigLoader::load_scenario_file(ConfigSource::Yaml(yaml.unwrap()));
+            assert!(
+                result.is_ok(),
+                "Scenario file {} should parse correctly: {:?}",
+                file,
+                result.err()
+            );
+        }
+    }
+
+    #[test]
+    fn test_all_infrastructure_configs_parse() {
+        // Test that all infrastructure configs in config/ directory parse correctly
+        let config_files = [
+            "config/rsbench.config.yaml",
+            "config/rsbench.config.staging.yaml",
+            "config/rsbench.config.prod.yaml",
+        ];
+
+        for file in &config_files {
+            let yaml = std::fs::read_to_string(file);
+            if yaml.is_err() {
+                continue; // Skip if file doesn't exist
+            }
+
+            let result = ConfigLoader::load_infrastructure(ConfigSource::Yaml(yaml.unwrap()));
+            assert!(
+                result.is_ok(),
+                "Infrastructure config {} should parse correctly: {:?}",
+                file,
+                result.err()
+            );
+        }
     }
 }

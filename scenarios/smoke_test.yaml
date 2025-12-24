@@ -1,0 +1,24 @@
+# Smoke Test Scenario
+#
+# Quick sanity check to verify database connectivity and basic functionality.
+# Runs for a short duration with low load.
+
+scenario:
+  executor:
+    type: constant-rate
+    rate: 100           # Low rate for quick validation
+    duration: 10s       # Short duration
+    max_connections: 10
+
+  workload:
+    type: builtin
+    name: oltp_read_write
+    table_count: 1
+    table_size: 1000    # Small dataset
+
+determinism:
+  seed: 42
+  strict_mode: false
+
+output:
+  format: text        # Human-readable for quick check

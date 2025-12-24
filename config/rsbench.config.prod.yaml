@@ -1,0 +1,27 @@
+# RSBench Infrastructure Configuration - Production Environment
+#
+# Production-specific database and runtime settings.
+# USE WITH CAUTION - Running benchmarks against production databases can impact performance.
+#
+# Usage:
+#   rsbench --config config/rsbench.config.prod.yaml --scenario scenarios/my_test.yaml
+
+database:
+  driver: mysql
+  # Use read replica for benchmarking to avoid impacting production writes
+  connection_string: "mysql://readonly:prod_pass@prod-replica.example.com:3306/sbtest"
+  pool:
+    min_size: 10
+    max_size: 50  # Conservative limit for production
+    connection_timeout: 10s
+    idle_timeout: 300s
+
+runtime:
+  type: async
+  workers: 4
+  max_connections: 50  # Conservative limit
+  backpressure_threshold: 0.8
+
+output:
+  format: json
+  file: results/prod_{timestamp}.json

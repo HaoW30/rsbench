@@ -1,0 +1,37 @@
+# Capacity Test Scenario
+#
+# Gradually increases load to find the database capacity limits.
+# Watch for when backpressure events start occurring and latency degrades.
+
+scenario:
+  executor:
+    type: ramping-rate
+    stages:
+      - duration: 60s
+        target_rate: 500
+      - duration: 60s
+        target_rate: 1000
+      - duration: 60s
+        target_rate: 2000
+      - duration: 60s
+        target_rate: 5000
+      - duration: 60s
+        target_rate: 10000
+      - duration: 60s
+        target_rate: 15000
+    prealloc_connections: 50
+    max_connections: 200
+
+  workload:
+    type: builtin
+    name: oltp_read_write
+    table_count: 10
+    table_size: 50000
+
+determinism:
+  seed: 42
+  strict_mode: false
+
+output:
+  format: json
+  file: results/capacity_test_{timestamp}.json
