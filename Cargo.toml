@@ -34,7 +34,7 @@ serde_yaml = "0.9"
 serde_json = "1.0"
 
 # Scripting (Lua)
-mlua = { version = "0.9", features = ["luajit", "async", "serialize"] }
+mlua = { version = "0.9", features = ["luajit", "async", "serialize"], optional = true }
 
 # Random Number Generation (Deterministic)
 rand = "0.8"
@@ -48,6 +48,15 @@ thiserror = "1.0"
 # Utilities
 chrono = "0.4"
 url = "2.5"
+humantime = "2.1"
+humantime-serde = "1.1"
+num_cpus = "1.16"
+
+# Async Traits
+async-trait = "0.1"
+
+# Connection Pooling
+deadpool = { version = "0.12", features = ["managed"] }
 
 [dev-dependencies]
 proptest = "1.5"
@@ -57,7 +66,9 @@ criterion = "0.5"
 default = ["mysql"]
 mysql = ["mysql_async"]
 postgres = ["tokio-postgres"]
+lua = ["mlua"]
 all-drivers = ["mysql", "postgres"]
+full = ["mysql", "postgres", "lua"]
 
 [profile.release]
 opt-level = 3
