@@ -1,0 +1,38 @@
+# RSBench Example Configuration - Milestone 0
+# A basic configuration file demonstrating rate-based MySQL benchmarking
+
+database:
+  driver: mysql
+  connection_string: "mysql://root@localhost:3306/testdb"
+  pool:
+    min_size: 10
+    max_size: 100
+    connection_timeout: 10s
+    idle_timeout: 5m
+
+runtime:
+  type: async
+  workers: 8
+  max_connections: 100
+  backpressure_threshold: 0.8
+
+scenario:
+  executor:
+    type: constant-rate
+    rate: 1000  # 1000 operations per second
+    duration: 1m
+    max_connections: 100
+
+  workload:
+    type: builtin
+    name: oltp_read_write
+    table_count: 10
+    table_size: 10000
+
+determinism:
+  seed: 12345
+  strict_mode: false
+
+output:
+  format: json
+  # file: results.json  # Uncomment to write to file instead of stdout

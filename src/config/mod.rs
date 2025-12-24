@@ -1,0 +1,308 @@
+//! Configuration module
+//!
+//! Handles loading, parsing, and validating configuration from various sources.
+
+use serde::{Deserialize, Serialize};
+use std::path::PathBuf;
+use std::time::Duration;
+
+use crate::{Error, Result};
+
+/// Configuration loader - entry point for loading config
+pub struct ConfigLoader;
+
+impl ConfigLoader {
+    /// Load configuration from various sources
+    pub fn load(source: ConfigSource) -> Result<ToolConfig> {
+        match source {
+            ConfigSource::File(path) => Self::load_from_file(&path),
+            ConfigSource::Yaml(content) => Self::load_from_yaml(&content),
+            ConfigSource::CliArgs(args) => Self::load_from_cli(args),
+        }
+    }
+
+    /// Validate configuration consistency
+    pub fn validate(_config: &ToolConfig) -> Result<()> {
+        // TODO: Implement validation logic
+        // - Check pool config constraints
+        // - Validate connection string format
+        // - Verify rate > 0
+        // - Check duration > 0
+        Ok(())
+    }
+
+    /// Merge CLI args with file config (precedence: CLI > file > defaults)
+    pub fn merge(file_config: ToolConfig, _cli_args: CliArgs) -> ToolConfig {
+        // TODO: Implement merge logic
+        file_config
+    }
+
+    /// Apply default values to incomplete config
+    pub fn with_defaults(config: ToolConfig) -> ToolConfig {
+        // TODO: Apply defaults
+        config
+    }
+
+    fn load_from_file(path: &PathBuf) -> Result<ToolConfig> {
+        let content = std::fs::read_to_string(path)?;
+        Self::load_from_yaml(&content)
+    }
+
+    fn load_from_yaml(content: &str) -> Result<ToolConfig> {
+        serde_yaml::from_str(content)
+            .map_err(|e| Error::Config(format!("YAML parse error: {}", e)))
+    }
+
+    fn load_from_cli(_args: CliArgs) -> Result<ToolConfig> {
+        // TODO: Build config from CLI args
+        Err(Error::Config("CLI-only config not yet implemented".into()))
+    }
+}
+
+/// Configuration source
+pub enum ConfigSource {
+    /// Load from YAML file
+    File(PathBuf),
+    /// Parse from YAML string
+    Yaml(String),
+    /// From CLI arguments only
+    CliArgs(CliArgs),
+}
+
+/// Root configuration structure (M0 simplified)
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct ToolConfig {
+    pub database: DatabaseConfig,
+    pub runtime: RuntimeConfig,
+    pub scenario: ScenarioConfig,
+    #[serde(default)]
+    pub determinism: DeterminismConfig,
+    pub output: OutputConfig,
+}
+
+/// Database configuration
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct DatabaseConfig {
+    /// Driver name ("mysql")
+    pub driver: String,
+
+    /// Connection string (e.g., "mysql://user:pass@host:port/db")
+    pub connection_string: String,
+
+    /// Connection pool configuration
+    #[serde(default)]
+    pub pool: PoolConfig,
+}
+
+/// Connection pool configuration
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct PoolConfig {
+    /// Minimum pool size
+    #[serde(default = "default_min_size")]
+    pub min_size: usize,
+
+    /// Maximum pool size
+    #[serde(default = "default_max_size")]
+    pub max_size: usize,
+
+    /// Connection timeout
+    #[serde(default = "default_connection_timeout", with = "humantime_serde")]
+    pub connection_timeout: Duration,
+
+    /// Idle connection timeout
+    #[serde(default = "default_idle_timeout", with = "humantime_serde")]
+    pub idle_timeout: Duration,
+}
+
+impl Default for PoolConfig {
+    fn default() -> Self {
+        Self {
+            min_size: default_min_size(),
+            max_size: default_max_size(),
+            connection_timeout: default_connection_timeout(),
+            idle_timeout: default_idle_timeout(),
+        }
+    }
+}
+
+fn default_min_size() -> usize {
+    10
+}
+fn default_max_size() -> usize {
+    100
+}
+fn default_connection_timeout() -> Duration {
+    Duration::from_secs(10)
+}
+fn default_idle_timeout() -> Duration {
+    Duration::from_secs(300)
+}
+
+/// Runtime configuration
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct RuntimeConfig {
+    #[serde(flatten)]
+    pub mode: RuntimeMode,
+}
+
+/// Runtime execution mode
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(tag = "type", rename_all = "lowercase")]
+pub enum RuntimeMode {
+    /// Blocking mode (sysbench compatibility)
+    Blocking {
+        #[serde(default = "default_threads")]
+        threads: usize,
+    },
+    /// Async mode (primary, backpressure-aware)
+    Async {
+        #[serde(default = "default_workers")]
+        workers: usize,
+
+        #[serde(default = "default_max_connections")]
+        max_connections: usize,
+
+        #[serde(default = "default_backpressure_threshold")]
+        backpressure_threshold: f64,
+    },
+}
+
+fn default_threads() -> usize {
+    16
+}
+fn default_workers() -> usize {
+    num_cpus::get()
+}
+fn default_max_connections() -> usize {
+    100
+}
+fn default_backpressure_threshold() -> f64 {
+    0.8
+}
+
+/// Scenario configuration (M0: single scenario only)
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct ScenarioConfig {
+    /// Executor configuration
+    pub executor: ExecutorConfig,
+
+    /// Workload definition
+    pub workload: WorkloadConfig,
+}
+
+/// Executor configuration (M0: constant-rate and ramping-rate)
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(tag = "type", rename_all = "kebab-case")]
+pub enum ExecutorConfig {
+    ConstantRate {
+        /// Operations per second
+        rate: u64,
+
+        /// Test duration
+        #[serde(with = "humantime_serde")]
+        duration: Duration,
+
+        /// Maximum concurrent connections
+        #[serde(default = "default_max_connections")]
+        max_connections: usize,
+    },
+    RampingRate {
+        /// Rate stages
+        stages: Vec<RateStage>,
+
+        /// Preallocate connections
+        #[serde(default = "default_prealloc")]
+        prealloc_connections: usize,
+
+        /// Maximum concurrent connections
+        #[serde(default = "default_max_connections")]
+        max_connections: usize,
+    },
+}
+
+fn default_prealloc() -> usize {
+    50
+}
+
+/// Rate stage for ramping executor
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct RateStage {
+    #[serde(with = "humantime_serde")]
+    pub duration: Duration,
+    pub target_rate: u64,
+}
+
+/// Workload configuration (M0: builtin or Lua)
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(tag = "type", rename_all = "lowercase")]
+pub enum WorkloadConfig {
+    /// Built-in OLTP workload
+    Builtin {
+        name: String, // "oltp_read_write"
+        #[serde(default = "default_table_count")]
+        table_count: usize,
+        #[serde(default = "default_table_size")]
+        table_size: usize,
+    },
+    /// Lua script (sysbench compatible)
+    Lua { script: PathBuf },
+}
+
+fn default_table_count() -> usize {
+    10
+}
+fn default_table_size() -> usize {
+    10000
+}
+
+/// Determinism configuration
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct DeterminismConfig {
+    /// RNG seed
+    #[serde(default = "default_seed")]
+    pub seed: u64,
+
+    /// Strict mode (fail on non-deterministic operations)
+    #[serde(default)]
+    pub strict_mode: bool,
+}
+
+fn default_seed() -> u64 {
+    42
+}
+
+impl Default for DeterminismConfig {
+    fn default() -> Self {
+        Self {
+            seed: default_seed(),
+            strict_mode: false,
+        }
+    }
+}
+
+/// Output configuration (M0: text or JSON)
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct OutputConfig {
+    /// Output format
+    pub format: OutputFormat,
+
+    /// Output file (None = stdout)
+    pub file: Option<PathBuf>,
+}
+
+#[derive(Debug, Clone, Copy, Serialize, Deserialize)]
+#[serde(rename_all = "lowercase")]
+pub enum OutputFormat {
+    Text,
+    Json,
+}
+
+/// CLI arguments structure
+pub struct CliArgs {
+    pub config_file: Option<PathBuf>,
+    pub database_url: Option<String>,
+    pub rate: Option<u64>,
+    pub duration: Option<Duration>,
+    pub threads: Option<usize>,
+    pub output_format: Option<OutputFormat>,
+}

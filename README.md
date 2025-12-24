@@ -13,7 +13,7 @@ RSBench is a next-generation database benchmarking and testing tool built in Rus
 
 Traditional database testing tools like sysbench have served the community well, but fall short in the cloud-native era. As databases evolved to become distributed, cloud-native systems with multi-region capabilities and new distributed SQL architectures, testing tools remained anchored in single-node assumptions.
 
-RSBench bridges the following gaps with **distributed-aware** testing for modern databases:
+RSBench bridges the following sysbench gaps with **distributed-aware** testing for modern databases:
 
 - **Thread-based load generation** conflates concurrency with load
 - **Blocking I/O** hides client-side bottlenecks
