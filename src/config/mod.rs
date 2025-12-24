@@ -508,4 +508,21 @@ output:
             _ => panic!("Expected RampingRate"),
         }
     }
+
+    #[test]
+    fn test_load_default_config_file() {
+        // Test that the default config file in the repo can be loaded
+        let yaml = std::fs::read_to_string("rsbench.default.yaml");
+        if yaml.is_err() {
+            // Skip test if file doesn't exist (e.g., in some test environments)
+            return;
+        }
+
+        let result = ConfigLoader::load(ConfigSource::Yaml(yaml.unwrap()));
+        assert!(result.is_ok(), "Default config file should parse correctly");
+
+        let config = result.unwrap();
+        assert_eq!(config.database.driver, "mysql");
+        assert_eq!(config.determinism.seed, 42);
+    }
 }

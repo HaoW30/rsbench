@@ -60,7 +60,24 @@ cd rsbench
 cargo build --release
 ```
 
-<!-- Quick Start and detailed examples coming soon -->
+### Quick Configuration
+
+Copy and customize the default configuration:
+
+```bash
+# Copy the default config as a starting point
+cp rsbench.default.yaml my_benchmark.yaml
+
+# Edit to match your database and requirements
+vim my_benchmark.yaml
+
+# Run the benchmark
+./target/release/rsbench --config my_benchmark.yaml
+```
+
+The `rsbench.default.yaml` file contains all available options with detailed comments and examples.
+
+<!-- Detailed documentation coming soon -->
 
 ## Architecture
 

@@ -11,34 +11,33 @@ database:
     idle_timeout: 60s
 
 runtime:
-  mode:
-    async:
-      workers: 8
-      max_connections: 100
-      backpressure_threshold: 0.8
+  type: async
+  workers: 8
+  max_connections: 100
+  backpressure_threshold: 0.8
 
 scenario:
   executor:
-    ramping_rate:
-      stages:
-        - duration: 30s
-          target_rate: 500
-        - duration: 30s
-          target_rate: 1000
-        - duration: 30s
-          target_rate: 2000
-        - duration: 30s
-          target_rate: 5000
-        - duration: 30s
-          target_rate: 10000
-      prealloc_connections: 10
-      max_connections: 100
+    type: ramping-rate
+    stages:
+      - duration: 30s
+        target_rate: 500
+      - duration: 30s
+        target_rate: 1000
+      - duration: 30s
+        target_rate: 2000
+      - duration: 30s
+        target_rate: 5000
+      - duration: 30s
+        target_rate: 10000
+    prealloc_connections: 10
+    max_connections: 100
 
   workload:
-    builtin:
-      name: oltp_read_write
-      table_count: 10
-      table_size: 10000
+    type: builtin
+    name: oltp_read_write
+    table_count: 10
+    table_size: 10000
 
 determinism:
   seed: 42

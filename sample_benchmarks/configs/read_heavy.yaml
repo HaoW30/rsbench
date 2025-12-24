@@ -11,24 +11,23 @@ database:
     idle_timeout: 60s
 
 runtime:
-  mode:
-    async:
-      workers: 8
-      max_connections: 100
-      backpressure_threshold: 0.8
+  type: async
+  workers: 8
+  max_connections: 100
+  backpressure_threshold: 0.8
 
 scenario:
   executor:
-    constant_rate:
-      rate: 5000  # Higher rate for read workload
-      duration: 120s
-      max_connections: 100
+    type: constant-rate
+    rate: 5000  # Higher rate for read workload
+    duration: 120s
+    max_connections: 100
 
   workload:
-    builtin:
-      name: oltp_read_write  # TODO: Add read_heavy variant
-      table_count: 10
-      table_size: 100000
+    type: builtin
+    name: oltp_read_write  # TODO: Add read_heavy variant
+    table_count: 10
+    table_size: 100000
 
 determinism:
   seed: 42

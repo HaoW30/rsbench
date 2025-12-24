@@ -1,0 +1,206 @@
+# RSBench Default Configuration
+#
+# This file contains all available configuration options with their default values.
+# Copy this file and modify it to customize your benchmark.
+#
+# Usage: rsbench --config your_config.yaml
+
+# ============================================================================
+# Database Configuration
+# ============================================================================
+database:
+  # Database driver to use
+  # Options: "mysql", "postgres" (when feature is enabled)
+  driver: mysql
+
+  # Connection string for the database
+  # Format depends on the driver:
+  #   MySQL:    mysql://user:password@host:port/database
+  #   Postgres: postgresql://user:password@host:port/database
+  connection_string: "mysql://root:password@localhost:3306/sbtest"
+
+  # Connection pool configuration
+  pool:
+    # Minimum number of connections to maintain in the pool
+    # Default: 10
+    min_size: 10
+
+    # Maximum number of connections in the pool
+    # Default: 100
+    max_size: 100
+
+    # Timeout for establishing a new connection
+    # Default: 10s
+    connection_timeout: 10s
+
+    # Maximum time a connection can remain idle before being closed
+    # Default: 300s (5 minutes)
+    idle_timeout: 300s
+
+# ============================================================================
+# Runtime Configuration
+# ============================================================================
+runtime:
+  # Runtime execution mode
+  # Options: "async" (recommended) or "blocking" (sysbench compatibility)
+  type: async
+
+  # --- Async Mode Settings (when type: async) ---
+
+  # Number of worker threads for async runtime
+  # Default: number of CPU cores
+  # Recommended: equal to CPU cores or slightly higher
+  workers: 4
+
+  # Maximum number of concurrent database connections
+  # Default: 100
+  # Note: Should not exceed database max_connections
+  max_connections: 100
+
+  # Backpressure threshold (0.0 to 1.0)
+  # When pool utilization exceeds this, backpressure events are recorded
+  # Default: 0.8 (80%)
+  # Higher values = more aggressive before reporting backpressure
+  backpressure_threshold: 0.8
+
+  # --- Blocking Mode Settings (when type: blocking) ---
+  # Uncomment to use blocking mode instead:
+  # type: blocking
+  # threads: 16  # Number of blocking threads (default: 16)
+
+# ============================================================================
+# Scenario Configuration
+# ============================================================================
+scenario:
+  # Executor configuration - defines how load is applied
+  executor:
+    # Executor type: "constant-rate" or "ramping-rate"
+    type: constant-rate
+
+    # --- Constant Rate Settings ---
+
+    # Target operations per second
+    # Default: 1000
+    rate: 1000
+
+    # Duration to run the benchmark
+    # Examples: 30s, 5m, 1h
+    # Default: 60s
+    duration: 60s
+
+    # Maximum connections for this executor
+    # Default: 100
+    max_connections: 100
+
+    # --- Ramping Rate Settings (alternative to constant-rate) ---
+    # Uncomment to use ramping rate instead:
+    # type: ramping-rate
+    # stages:
+    #   - duration: 30s
+    #     target_rate: 100
+    #   - duration: 30s
+    #     target_rate: 500
+    #   - duration: 30s
+    #     target_rate: 1000
+    #   - duration: 30s
+    #     target_rate: 2000
+    # prealloc_connections: 50  # Pre-allocated connections (default: 50)
+    # max_connections: 100      # Maximum connections (default: 100)
+
+  # Workload configuration - defines what operations to execute
+  workload:
+    # Workload type: "builtin" or "lua"
+    type: builtin
+
+    # --- Builtin Workload Settings ---
+
+    # Builtin workload name
+    # Available: "oltp_read_write"
+    # Future: "oltp_read_only", "oltp_write_only", "oltp_point_select"
+    name: oltp_read_write
+
+    # Number of tables to create and use
+    # Default: 10
+    table_count: 10
+
+    # Number of rows per table
+    # Default: 10000
+    table_size: 10000
+
+    # --- Lua Workload Settings (alternative to builtin) ---
+    # Uncomment to use custom Lua workload instead:
+    # type: lua
+    # script: path/to/workload.lua
+
+# ============================================================================
+# Determinism Configuration
+# ============================================================================
+determinism:
+  # Random number generator seed
+  # Same seed produces identical operation sequences (for reproducibility)
+  # Default: 42
+  seed: 42
+
+  # Strict mode - fail on any non-deterministic behavior
+  # Default: false
+  # Set to true for exact reproducibility testing
+  strict_mode: false
+
+# ============================================================================
+# Output Configuration
+# ============================================================================
+output:
+  # Output format: "text" or "json"
+  # text: Human-readable, sysbench-compatible format
+  # json: Structured output for parsing/analysis
+  # Default: text
+  format: json
+
+  # Output file path (optional)
+  # If not specified, results are written to stdout
+  # Examples:
+  #   file: results.json
+  #   file: /path/to/results.txt
+  file: null
+
+# ============================================================================
+# Example Configurations
+# ============================================================================
+
+# Example 1: High-throughput benchmark
+# ----------------------------------
+# runtime:
+#   type: async
+#   workers: 16
+#   max_connections: 200
+# scenario:
+#   executor:
+#     type: constant-rate
+#     rate: 10000
+#     duration: 300s
+
+# Example 2: Capacity testing with ramping load
+# ----------------------------------
+# scenario:
+#   executor:
+#     type: ramping-rate
+#     stages:
+#       - duration: 60s
+#         target_rate: 1000
+#       - duration: 60s
+#         target_rate: 5000
+#       - duration: 60s
+#         target_rate: 10000
+
+# Example 3: Long-duration stability test
+# ----------------------------------
+# scenario:
+#   executor:
+#     type: constant-rate
+#     rate: 1000
+#     duration: 1h
+#   workload:
+#     type: builtin
+#     name: oltp_read_write
+#     table_count: 100
+#     table_size: 1000000
