@@ -1,0 +1,39 @@
+# Read-Heavy Benchmark
+# 90% reads, 10% writes - typical for read-heavy applications
+
+database:
+  driver: mysql
+  connection_string: "mysql://user:password@localhost:3306/testdb"
+  pool:
+    min_size: 10
+    max_size: 100
+    connection_timeout: 5s
+    idle_timeout: 60s
+
+runtime:
+  mode:
+    async:
+      workers: 8
+      max_connections: 100
+      backpressure_threshold: 0.8
+
+scenario:
+  executor:
+    constant_rate:
+      rate: 5000  # Higher rate for read workload
+      duration: 120s
+      max_connections: 100
+
+  workload:
+    builtin:
+      name: oltp_read_write  # TODO: Add read_heavy variant
+      table_count: 10
+      table_size: 100000
+
+determinism:
+  seed: 42
+  strict_mode: false
+
+output:
+  format: json
+  file: results_read_heavy.json

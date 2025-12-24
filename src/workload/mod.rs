@@ -124,3 +124,112 @@ impl WorkloadFactory {
         }
     }
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn test_operation_type_variants() {
+        let read_op = OperationType::Read;
+        let write_op = OperationType::Write;
+
+        // Test pattern matching
+        match read_op {
+            OperationType::Read => {},
+            _ => panic!("Expected Read variant"),
+        }
+
+        match write_op {
+            OperationType::Write => {},
+            _ => panic!("Expected Write variant"),
+        }
+    }
+
+    #[test]
+    fn test_execution_context_creation() {
+        let ctx = ExecutionContext {
+            worker_id: 1,
+            iteration: 42,
+            elapsed: Duration::from_secs(10),
+        };
+
+        assert_eq!(ctx.worker_id, 1);
+        assert_eq!(ctx.iteration, 42);
+        assert_eq!(ctx.elapsed, Duration::from_secs(10));
+    }
+
+    #[test]
+    fn test_operation_creation() {
+        let op = Operation {
+            name: "test_op".to_string(),
+            sql: "SELECT * FROM test".to_string(),
+            params: vec![Value::Int(42)],
+            operation_type: OperationType::Read,
+        };
+
+        assert_eq!(op.name, "test_op");
+        assert_eq!(op.sql, "SELECT * FROM test");
+        assert_eq!(op.params.len(), 1);
+
+        match op.operation_type {
+            OperationType::Read => {},
+            _ => panic!("Expected Read operation type"),
+        }
+    }
+
+    #[test]
+    fn test_workload_factory_builtin_oltp() {
+        let config = WorkloadConfig::Builtin {
+            name: "oltp_read_write".to_string(),
+            table_count: 1,
+            table_size: 100,
+        };
+
+        let result = WorkloadFactory::create(&config, 42);
+        assert!(result.is_ok());
+
+        let workload = result.unwrap();
+        assert_eq!(workload.name(), "oltp_read_write");
+    }
+
+    #[test]
+    fn test_workload_factory_unknown_builtin() {
+        let config = WorkloadConfig::Builtin {
+            name: "unknown_workload".to_string(),
+            table_count: 1,
+            table_size: 100,
+        };
+
+        let result = WorkloadFactory::create(&config, 42);
+        assert!(result.is_err());
+
+        match result {
+            Err(crate::Error::Workload(msg)) => {
+                assert!(msg.contains("Unknown builtin workload"));
+                assert!(msg.contains("unknown_workload"));
+            }
+            _ => panic!("Expected Workload error"),
+        }
+    }
+
+    #[test]
+    #[cfg(not(feature = "lua"))]
+    fn test_workload_factory_lua_not_compiled() {
+        use std::path::PathBuf;
+
+        let config = WorkloadConfig::Lua {
+            script: PathBuf::from("test.lua"),
+        };
+
+        let result = WorkloadFactory::create(&config, 42);
+        assert!(result.is_err());
+
+        match result {
+            Err(crate::Error::Workload(msg)) => {
+                assert!(msg.contains("Lua support not compiled in"));
+            }
+            _ => panic!("Expected Workload error about Lua not compiled"),
+        }
+    }
+}

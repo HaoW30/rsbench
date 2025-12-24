@@ -143,3 +143,68 @@ pub struct ScenarioResult {
     pub operations_failed: u64,
     pub metrics: MetricsSnapshot,
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::collections::HashMap;
+
+    #[test]
+    fn test_scenario_result_creation() {
+        use crate::metrics::{MetricsSnapshot, OperationMetricsSnapshot};
+        use hdrhistogram::Histogram;
+
+        let metrics_snapshot = MetricsSnapshot {
+            operation_metrics: HashMap::new(),
+            backpressure_events: 0,
+            duration: Duration::from_secs(10),
+            timestamp: std::time::SystemTime::now(),
+        };
+
+        let result = ScenarioResult {
+            duration: Duration::from_secs(60),
+            operations_completed: 1000,
+            operations_failed: 5,
+            metrics: metrics_snapshot,
+        };
+
+        assert_eq!(result.duration, Duration::from_secs(60));
+        assert_eq!(result.operations_completed, 1000);
+        assert_eq!(result.operations_failed, 5);
+    }
+
+    #[test]
+    fn test_scenario_result_success_rate() {
+        use crate::metrics::{MetricsSnapshot, OperationMetricsSnapshot};
+        use hdrhistogram::Histogram;
+
+        let mut operation_metrics = HashMap::new();
+        operation_metrics.insert(
+            "test_op".to_string(),
+            OperationMetricsSnapshot {
+                count: 1000,
+                errors: 50,
+                latency_histogram: Histogram::new(3).unwrap(),
+            },
+        );
+
+        let metrics_snapshot = MetricsSnapshot {
+            operation_metrics,
+            backpressure_events: 0,
+            duration: Duration::from_secs(10),
+            timestamp: std::time::SystemTime::now(),
+        };
+
+        let result = ScenarioResult {
+            duration: Duration::from_secs(60),
+            operations_completed: 1000,
+            operations_failed: 50,
+            metrics: metrics_snapshot,
+        };
+
+        let op_metrics = result.metrics.operation_metrics.get("test_op").unwrap();
+        let success_rate = op_metrics.success_rate();
+
+        assert!((success_rate - 0.95).abs() < f64::EPSILON);
+    }
+}

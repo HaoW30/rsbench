@@ -139,3 +139,150 @@ impl OperationMetricsSnapshot {
         }
     }
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::driver::QueryResult;
+
+    #[test]
+    fn test_metrics_collector_creation() {
+        let collector = MetricsCollector::new();
+        let snapshot = collector.snapshot();
+
+        assert_eq!(snapshot.operation_metrics.len(), 0);
+        assert_eq!(snapshot.backpressure_events, 0);
+    }
+
+    #[test]
+    fn test_record_successful_operation() {
+        let collector = MetricsCollector::new();
+        let result = Ok(QueryResult {
+            rows_affected: 1,
+            last_insert_id: None,
+        });
+
+        collector.record_operation("test_op", Duration::from_millis(10), &result);
+
+        let snapshot = collector.snapshot();
+        let metrics = snapshot.operation_metrics.get("test_op").unwrap();
+
+        assert_eq!(metrics.count, 1);
+        assert_eq!(metrics.errors, 0);
+    }
+
+    #[test]
+    fn test_record_failed_operation() {
+        let collector = MetricsCollector::new();
+        let result: Result<QueryResult> =
+            Err(crate::Error::Database(crate::DatabaseError::Query(
+                "test error".to_string(),
+            )));
+
+        collector.record_operation("test_op", Duration::from_millis(10), &result);
+
+        let snapshot = collector.snapshot();
+        let metrics = snapshot.operation_metrics.get("test_op").unwrap();
+
+        assert_eq!(metrics.count, 1);
+        assert_eq!(metrics.errors, 1);
+    }
+
+    #[test]
+    fn test_record_multiple_operations() {
+        let collector = MetricsCollector::new();
+        let success_result = Ok(QueryResult {
+            rows_affected: 1,
+            last_insert_id: None,
+        });
+
+        for _ in 0..10 {
+            collector.record_operation("test_op", Duration::from_millis(5), &success_result);
+        }
+
+        let snapshot = collector.snapshot();
+        let metrics = snapshot.operation_metrics.get("test_op").unwrap();
+
+        assert_eq!(metrics.count, 10);
+        assert_eq!(metrics.errors, 0);
+    }
+
+    #[test]
+    fn test_record_backpressure_events() {
+        let collector = MetricsCollector::new();
+
+        collector.record_backpressure_event();
+        collector.record_backpressure_event();
+        collector.record_backpressure_event();
+
+        let snapshot = collector.snapshot();
+        assert_eq!(snapshot.backpressure_events, 3);
+    }
+
+    #[test]
+    fn test_success_rate_calculation() {
+        let metrics = OperationMetricsSnapshot {
+            count: 100,
+            errors: 5,
+            latency_histogram: Histogram::new(3).unwrap(),
+        };
+
+        let success_rate = metrics.success_rate();
+        assert!((success_rate - 0.95).abs() < f64::EPSILON);
+    }
+
+    #[test]
+    fn test_success_rate_zero_count() {
+        let metrics = OperationMetricsSnapshot {
+            count: 0,
+            errors: 0,
+            latency_histogram: Histogram::new(3).unwrap(),
+        };
+
+        assert_eq!(metrics.success_rate(), 0.0);
+    }
+
+    #[test]
+    fn test_throughput_calculation() {
+        let metrics = OperationMetricsSnapshot {
+            count: 1000,
+            errors: 0,
+            latency_histogram: Histogram::new(3).unwrap(),
+        };
+
+        let throughput = metrics.throughput(Duration::from_secs(10));
+        assert!((throughput - 100.0).abs() < f64::EPSILON);
+    }
+
+    #[test]
+    fn test_throughput_zero_duration() {
+        let metrics = OperationMetricsSnapshot {
+            count: 100,
+            errors: 0,
+            latency_histogram: Histogram::new(3).unwrap(),
+        };
+
+        assert_eq!(metrics.throughput(Duration::from_secs(0)), 0.0);
+    }
+
+    #[test]
+    fn test_latency_histogram_recording() {
+        let collector = MetricsCollector::new();
+        let result = Ok(QueryResult {
+            rows_affected: 1,
+            last_insert_id: None,
+        });
+
+        // Record operations with different latencies
+        collector.record_operation("test_op", Duration::from_millis(1), &result);
+        collector.record_operation("test_op", Duration::from_millis(2), &result);
+        collector.record_operation("test_op", Duration::from_millis(3), &result);
+
+        let snapshot = collector.snapshot();
+        let metrics = snapshot.operation_metrics.get("test_op").unwrap();
+
+        // Verify histogram has data
+        assert!(metrics.latency_histogram.len() > 0);
+        assert_eq!(metrics.count, 3);
+    }
+}

@@ -306,3 +306,206 @@ pub struct CliArgs {
     pub threads: Option<usize>,
     pub output_format: Option<OutputFormat>,
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn test_load_config_from_yaml() {
+        let yaml = r#"
+database:
+  driver: mysql
+  connection_string: "mysql://localhost/test"
+  pool:
+    min_size: 1
+    max_size: 10
+    connection_timeout: 5s
+    idle_timeout: 60s
+
+runtime:
+  type: async
+  workers: 4
+  max_connections: 10
+  backpressure_threshold: 0.8
+
+scenario:
+  executor:
+    type: constant-rate
+    rate: 1000
+    duration: 60s
+    max_connections: 10
+  workload:
+    type: builtin
+    name: oltp_read_write
+    table_count: 10
+    table_size: 10000
+
+determinism:
+  seed: 42
+  strict_mode: false
+
+output:
+  format: json
+  file: null
+"#;
+
+        let config = ConfigLoader::load(ConfigSource::Yaml(yaml.to_string()));
+        if let Err(e) = &config {
+            panic!("Config loading failed: {:?}", e);
+        }
+
+        let config = config.unwrap();
+        assert_eq!(config.database.driver, "mysql");
+        assert_eq!(config.determinism.seed, 42);
+    }
+
+    #[test]
+    fn test_invalid_yaml_returns_error() {
+        let invalid_yaml = "invalid: yaml: content: [";
+        let result = ConfigLoader::load(ConfigSource::Yaml(invalid_yaml.to_string()));
+        assert!(result.is_err());
+    }
+
+    #[test]
+    fn test_config_validation() {
+        let yaml = r#"
+database:
+  driver: mysql
+  connection_string: "mysql://localhost/test"
+
+runtime:
+  type: async
+  workers: 4
+  max_connections: 10
+  backpressure_threshold: 0.8
+
+scenario:
+  executor:
+    type: constant-rate
+    rate: 1000
+    duration: 60s
+    max_connections: 10
+  workload:
+    type: builtin
+    name: oltp_read_write
+
+output:
+  format: text
+"#;
+
+        let config = ConfigLoader::load(ConfigSource::Yaml(yaml.to_string())).unwrap();
+        let result = ConfigLoader::validate(&config);
+        assert!(result.is_ok());
+    }
+
+    #[test]
+    fn test_determinism_config_default() {
+        let config = DeterminismConfig::default();
+        assert_eq!(config.seed, 42);
+        assert!(!config.strict_mode);
+    }
+
+    #[test]
+    fn test_output_format_variants() {
+        let text = OutputFormat::Text;
+        let json = OutputFormat::Json;
+
+        // Just verify they exist and can be pattern matched
+        match text {
+            OutputFormat::Text => {},
+            _ => panic!("Expected Text variant"),
+        }
+
+        match json {
+            OutputFormat::Json => {},
+            _ => panic!("Expected Json variant"),
+        }
+    }
+
+    #[test]
+    fn test_pool_config_default() {
+        let pool = PoolConfig::default();
+        assert_eq!(pool.min_size, 10);
+        assert_eq!(pool.max_size, 100);
+        assert_eq!(pool.connection_timeout, Duration::from_secs(10));
+        assert_eq!(pool.idle_timeout, Duration::from_secs(300));
+    }
+
+    #[test]
+    fn test_runtime_mode_async() {
+        let mode = RuntimeMode::Async {
+            workers: 4,
+            max_connections: 10,
+            backpressure_threshold: 0.8,
+        };
+
+        match mode {
+            RuntimeMode::Async { workers, max_connections, backpressure_threshold } => {
+                assert_eq!(workers, 4);
+                assert_eq!(max_connections, 10);
+                assert!((backpressure_threshold - 0.8).abs() < f64::EPSILON);
+            }
+            _ => panic!("Expected Async mode"),
+        }
+    }
+
+    #[test]
+    fn test_runtime_mode_blocking() {
+        let mode = RuntimeMode::Blocking { threads: 8 };
+
+        match mode {
+            RuntimeMode::Blocking { threads } => {
+                assert_eq!(threads, 8);
+            }
+            _ => panic!("Expected Blocking mode"),
+        }
+    }
+
+    #[test]
+    fn test_executor_config_constant_rate() {
+        let executor = ExecutorConfig::ConstantRate {
+            rate: 1000,
+            duration: Duration::from_secs(60),
+            max_connections: 50,
+        };
+
+        match executor {
+            ExecutorConfig::ConstantRate { rate, duration, max_connections } => {
+                assert_eq!(rate, 1000);
+                assert_eq!(duration, Duration::from_secs(60));
+                assert_eq!(max_connections, 50);
+            }
+            _ => panic!("Expected ConstantRate"),
+        }
+    }
+
+    #[test]
+    fn test_executor_config_ramping_rate() {
+        let stages = vec![
+            RateStage {
+                duration: Duration::from_secs(30),
+                target_rate: 500,
+            },
+            RateStage {
+                duration: Duration::from_secs(30),
+                target_rate: 1000,
+            },
+        ];
+
+        let executor = ExecutorConfig::RampingRate {
+            stages: stages.clone(),
+            prealloc_connections: 10,
+            max_connections: 50,
+        };
+
+        match executor {
+            ExecutorConfig::RampingRate { stages: s, .. } => {
+                assert_eq!(s.len(), 2);
+                assert_eq!(s[0].target_rate, 500);
+                assert_eq!(s[1].target_rate, 1000);
+            }
+            _ => panic!("Expected RampingRate"),
+        }
+    }
+}

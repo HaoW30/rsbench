@@ -101,3 +101,91 @@ impl Default for DriverRegistry {
         Self::new()
     }
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn test_query_result_creation() {
+        let result = QueryResult {
+            rows_affected: 5,
+            last_insert_id: Some(42),
+        };
+
+        assert_eq!(result.rows_affected, 5);
+        assert_eq!(result.last_insert_id, Some(42));
+    }
+
+    #[test]
+    fn test_query_result_no_insert_id() {
+        let result = QueryResult {
+            rows_affected: 3,
+            last_insert_id: None,
+        };
+
+        assert_eq!(result.rows_affected, 3);
+        assert!(result.last_insert_id.is_none());
+    }
+
+    #[test]
+    fn test_driver_capabilities() {
+        let caps = DriverCapabilities {
+            supports_transactions: true,
+            supports_prepared_statements: true,
+        };
+
+        assert!(caps.supports_transactions);
+        assert!(caps.supports_prepared_statements);
+    }
+
+    #[test]
+    fn test_connection_config() {
+        let config = ConnectionConfig {
+            connection_string: "mysql://localhost/test".to_string(),
+            timeout: Duration::from_secs(5),
+        };
+
+        assert_eq!(config.connection_string, "mysql://localhost/test");
+        assert_eq!(config.timeout, Duration::from_secs(5));
+    }
+
+    #[test]
+    fn test_driver_registry_default() {
+        let registry = DriverRegistry::default();
+
+        // Should have mysql driver if feature is enabled
+        #[cfg(feature = "mysql")]
+        {
+            let driver = registry.get("mysql");
+            assert!(driver.is_ok());
+        }
+    }
+
+    #[test]
+    fn test_driver_registry_get_missing() {
+        let registry = DriverRegistry::new();
+        let result = registry.get("nonexistent");
+
+        assert!(result.is_err());
+        match result {
+            Err(crate::Error::Database(DatabaseError::DriverNotFound(name))) => {
+                assert_eq!(name, "nonexistent");
+            }
+            _ => panic!("Expected DriverNotFound error"),
+        }
+    }
+
+    #[test]
+    #[cfg(feature = "mysql")]
+    fn test_driver_registry_mysql() {
+        let registry = DriverRegistry::new();
+        let driver = registry.get("mysql").unwrap();
+
+        assert_eq!(driver.name(), "mysql");
+
+        let caps = driver.capabilities();
+        assert!(caps.supports_transactions);
+        assert!(caps.supports_prepared_statements);
+    }
+}

@@ -117,3 +117,88 @@ impl MetricsOutput for JsonOutput {
         Ok(())
     }
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::metrics::{MetricsSnapshot, OperationMetricsSnapshot};
+    use hdrhistogram::Histogram;
+    use std::collections::HashMap;
+    use std::time::{Duration, SystemTime};
+
+    fn create_test_snapshot() -> MetricsSnapshot {
+        let mut operation_metrics = HashMap::new();
+        let mut histogram = Histogram::new(3).unwrap();
+        histogram.record(1000).unwrap(); // 1ms
+        histogram.record(2000).unwrap(); // 2ms
+        histogram.record(5000).unwrap(); // 5ms
+
+        operation_metrics.insert(
+            "test_op".to_string(),
+            OperationMetricsSnapshot {
+                count: 100,
+                errors: 5,
+                latency_histogram: histogram,
+            },
+        );
+
+        MetricsSnapshot {
+            operation_metrics,
+            backpressure_events: 3,
+            duration: Duration::from_secs(10),
+            timestamp: SystemTime::now(),
+        }
+    }
+
+    #[test]
+    fn test_text_output_export_succeeds() {
+        let snapshot = create_test_snapshot();
+        let buffer: Vec<u8> = Vec::new();
+        let mut output = TextOutput::new(Box::new(buffer));
+
+        let result = output.export(&snapshot);
+        assert!(result.is_ok());
+    }
+
+    #[test]
+    fn test_json_output_export_succeeds() {
+        let snapshot = create_test_snapshot();
+        let buffer: Vec<u8> = Vec::new();
+        let mut output = JsonOutput::new(Box::new(buffer));
+
+        let result = output.export(&snapshot);
+        assert!(result.is_ok());
+    }
+
+    #[test]
+    fn test_text_output_empty_metrics_succeeds() {
+        let snapshot = MetricsSnapshot {
+            operation_metrics: HashMap::new(),
+            backpressure_events: 0,
+            duration: Duration::from_secs(1),
+            timestamp: SystemTime::now(),
+        };
+
+        let buffer: Vec<u8> = Vec::new();
+        let mut output = TextOutput::new(Box::new(buffer));
+
+        let result = output.export(&snapshot);
+        assert!(result.is_ok());
+    }
+
+    #[test]
+    fn test_json_output_empty_metrics_succeeds() {
+        let snapshot = MetricsSnapshot {
+            operation_metrics: HashMap::new(),
+            backpressure_events: 0,
+            duration: Duration::from_secs(1),
+            timestamp: SystemTime::now(),
+        };
+
+        let buffer: Vec<u8> = Vec::new();
+        let mut output = JsonOutput::new(Box::new(buffer));
+
+        let result = output.export(&snapshot);
+        assert!(result.is_ok());
+    }
+}
