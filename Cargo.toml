@@ -1,0 +1,69 @@
+[package]
+name = "rsbench"
+version = "0.1.0"
+edition = "2021"
+authors = ["RSBench Contributors"]
+description = "A modern, time-driven database testing tool - the next generation of sysbench"
+repository = "https://github.com/yourusername/rsbench"
+license = "Apache-2.0"
+keywords = ["database", "benchmark", "testing", "performance", "mysql"]
+categories = ["command-line-utilities", "development-tools::testing"]
+
+[dependencies]
+# Async Runtime
+tokio = { version = "1.42", features = ["full"] }
+
+# Database Drivers
+mysql_async = { version = "0.34", optional = true }
+tokio-postgres = { version = "0.7", optional = true }
+
+# Metrics & Observability
+hdrhistogram = "7.5"
+tracing = "0.1"
+tracing-subscriber = { version = "0.3", features = ["env-filter"] }
+
+# Concurrency
+crossbeam = "0.8"
+dashmap = "6.1"
+
+# CLI & Configuration
+clap = { version = "4.5", features = ["derive", "env"] }
+serde = { version = "1.0", features = ["derive"] }
+toml = "0.8"
+serde_yaml = "0.9"
+serde_json = "1.0"
+
+# Scripting (Lua)
+mlua = { version = "0.9", features = ["luajit", "async", "serialize"] }
+
+# Random Number Generation (Deterministic)
+rand = "0.8"
+rand_chacha = "0.3"
+rand_distr = "0.4"
+
+# Error Handling
+anyhow = "1.0"
+thiserror = "1.0"
+
+# Utilities
+chrono = "0.4"
+url = "2.5"
+
+[dev-dependencies]
+proptest = "1.5"
+criterion = "0.5"
+
+[features]
+default = ["mysql"]
+mysql = ["mysql_async"]
+postgres = ["tokio-postgres"]
+all-drivers = ["mysql", "postgres"]
+
+[profile.release]
+opt-level = 3
+lto = true
+codegen-units = 1
+strip = true
+
+[profile.bench]
+inherits = "release"

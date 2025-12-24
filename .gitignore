@@ -1,0 +1,31 @@
+# Rust
+/target/
+Cargo.lock
+**/*.rs.bk
+*.pdb
+
+# Design documents (internal use only)
+rsbench_hld.txt
+rsbench_mld.txt
+
+# IDE / Editor
+.vscode/
+.idea/
+*.swp
+*.swo
+*~
+.DS_Store
+
+# Testing
+*.prof
+*.log
+
+# Benchmarks
+criterion/
+
+# Output files
+results/
+*.json
+*.csv
+!examples/*.json
+!examples/*.yaml
