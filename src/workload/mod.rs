@@ -3,11 +3,13 @@
 //! Defines workload abstraction and implementations.
 
 mod oltp;
+mod declarative;
 
 #[cfg(feature = "lua")]
 mod lua;
 
 pub use oltp::OltpReadWrite;
+pub use declarative::DeclarativeWorkload;
 
 #[cfg(feature = "lua")]
 pub use lua::LuaWorkload;
@@ -110,20 +112,22 @@ impl WorkloadFactory {
 
     fn create_declarative(
         file: Option<&std::path::PathBuf>,
-        _definition: Option<&serde_yaml::Value>,
+        definition: Option<&serde_yaml::Value>,
         _overrides: Option<&serde_yaml::Value>,
-        _seed: u64,
+        seed: u64,
     ) -> Result<Box<dyn Workload>> {
-        // TODO: Implement DeclarativeWorkload
-        // For now, return error indicating not yet implemented
-        if let Some(f) = file {
-            Err(crate::Error::Workload(format!(
-                "Declarative workloads not yet implemented. Requested: {}",
-                f.display()
-            )))
+        // Load from file or inline definition
+        if let Some(path) = file {
+            Ok(Box::new(DeclarativeWorkload::from_file(path, seed)?))
+        } else if let Some(def) = definition {
+            // Convert serde_yaml::Value to string and parse
+            let yaml_str = serde_yaml::to_string(def).map_err(|e| {
+                crate::Error::Workload(format!("Failed to serialize inline definition: {}", e))
+            })?;
+            Ok(Box::new(DeclarativeWorkload::from_yaml(&yaml_str, seed)?))
         } else {
             Err(crate::Error::Workload(
-                "Declarative workloads not yet implemented (inline definition)".into()
+                "Declarative workload must specify either 'file' or 'definition'".into()
             ))
         }
     }
