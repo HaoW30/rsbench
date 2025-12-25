@@ -1,0 +1,432 @@
+# RSBench Declarative Workload - Complete Reference
+#
+# This file demonstrates ALL available options and features for declarative workloads.
+# Use this as a reference when creating custom workload definitions.
+#
+# Quick Navigation:
+# 1. Basic Metadata
+# 2. Schema Definition
+# 3. Data Generation
+# 4. Cleanup Configuration
+# 5. Operations (Simple)
+# 6. Operations (Transactions)
+# 7. Parameter Distributions
+# 8. Parameter Generators
+# 9. Variable Substitution
+
+# ============================================================================
+# 1. BASIC METADATA
+# ============================================================================
+workload:
+  # Workload name (required)
+  name: example_all_features
+
+  # Description (optional)
+  description: "Comprehensive example demonstrating all workload features"
+
+  # ============================================================================
+  # 2. SCHEMA DEFINITION
+  # ============================================================================
+  schema:
+    tables:
+      # Table 1: Demonstrates all column types and constraints
+      - name: users
+        # Number of tables to create (uses name as prefix)
+        # Creates: users1, users2, users3 if count > 1
+        # Default: 1
+        count: 1
+
+        # Number of rows to insert during prepare phase
+        # Default: 10000
+        row_count: 10000
+
+        columns:
+          # Primary key with auto-increment
+          - name: user_id
+            type: INT
+            primary_key: true
+            auto_increment: true
+
+          # Integer column with index
+          - name: account_id
+            type: BIGINT
+            default: 0
+            index: idx_account  # Creates index named idx_account
+
+          # String columns (various types)
+          - name: username
+            type: VARCHAR(50)
+            default: ""
+
+          - name: email
+            type: VARCHAR(255)
+
+          - name: bio
+            type: TEXT
+
+          - name: status_code
+            type: CHAR(10)
+            default: "active"
+
+          # Numeric columns
+          - name: balance
+            type: DECIMAL(10,2)
+            default: 0.00
+
+          - name: score
+            type: FLOAT
+
+          - name: rating
+            type: DOUBLE
+
+      # Table 2: Simpler structure for testing
+      - name: orders
+        count: 5  # Creates orders1, orders2, ... orders5
+        row_count: 5000
+        columns:
+          - name: order_id
+            type: INT
+            primary_key: true
+            auto_increment: true
+
+          - name: user_id
+            type: INT
+            index: idx_user
+
+          - name: amount
+            type: DECIMAL(10,2)
+
+          - name: order_date
+            type: VARCHAR(20)
+
+  # ============================================================================
+  # 3. DATA GENERATION CONFIGURATION
+  # ============================================================================
+  data_generation:
+    # Strategy for generating initial data during prepare phase
+    # Options: uniform, zipfian, gaussian, sequential
+    # Default: uniform
+    strategy: uniform
+
+    # Optional: Override RNG seed for data generation
+    # seed: 12345
+
+  # ============================================================================
+  # 4. CLEANUP CONFIGURATION
+  # ============================================================================
+  cleanup_config:
+    # Whether to drop tables during cleanup phase
+    # Default: false
+    # Note: Currently only logs DROP TABLE statements (requires database access)
+    drop_tables: true
+
+  # ============================================================================
+  # 5. OPERATIONS - SIMPLE (NON-TRANSACTION)
+  # ============================================================================
+  operations:
+    # ========================================
+    # Simple SELECT operation
+    # ========================================
+    - name: select_user_by_id
+      weight: 30  # Relative weight (30% of operations)
+      type: read  # Operation type: read or write
+      sql: "SELECT * FROM users{table_id} WHERE user_id = ?"
+      parameters:
+        - name: table_id
+          distribution:
+            type: round_robin  # Cycles through tables
+            range: [1, "${table_count}"]
+        - name: user_id
+          distribution:
+            type: uniform  # Uniform random distribution
+            range: [1, "${row_count}"]
+
+    # ========================================
+    # SELECT with Zipfian distribution (hot keys)
+    # ========================================
+    - name: select_hot_users
+      weight: 20
+      type: read
+      sql: "SELECT username, email FROM users WHERE user_id = ?"
+      parameters:
+        - name: user_id
+          distribution:
+            type: zipfian  # Favors lower values (hot keys)
+            range: [1, 10000]
+
+    # ========================================
+    # SELECT with Gaussian distribution
+    # ========================================
+    - name: select_gaussian
+      weight: 10
+      type: read
+      sql: "SELECT * FROM users WHERE account_id = ?"
+      parameters:
+        - name: account_id
+          distribution:
+            type: gaussian  # Normal distribution centered on midpoint
+            range: [1, 10000]
+
+    # ========================================
+    # UPDATE operation with various generators
+    # ========================================
+    - name: update_user_profile
+      weight: 15
+      type: write
+      sql: "UPDATE users SET username = ?, email = ?, balance = ?, status_code = ? WHERE user_id = ?"
+      parameters:
+        - name: username
+          generator:
+            type: string
+            template: "user_{iteration:0>10}"  # Padded iteration number
+
+        - name: email
+          generator:
+            type: string
+            length: 20  # Random alphanumeric string of length 20
+
+        - name: balance
+          generator:
+            type: decimal  # or 'float'
+            range: [0, 10000]
+            precision: 2  # 2 decimal places
+
+        - name: status_code
+          generator:
+            type: choice
+            choices: ["active", "inactive", "pending", "suspended"]
+
+        - name: user_id
+          distribution:
+            type: uniform
+            range: [1, 10000]
+
+    # ========================================
+    # INSERT operation
+    # ========================================
+    - name: insert_order
+      weight: 10
+      type: write
+      sql: "INSERT INTO orders{table_id} (user_id, amount, order_date) VALUES (?, ?, ?)"
+      parameters:
+        - name: table_id
+          distribution:
+            type: round_robin
+            range: [1, 5]
+
+        - name: user_id
+          distribution:
+            type: uniform
+            range: [1, 10000]
+
+        - name: amount
+          generator:
+            type: decimal
+            range: [10, 1000]
+            precision: 2
+
+        - name: order_date
+          generator:
+            type: string
+            template: "2024-{iteration:0>10}"
+
+    # ========================================
+    # Custom fixed value generator
+    # ========================================
+    - name: update_status
+      weight: 5
+      type: write
+      sql: "UPDATE users SET status_code = ? WHERE user_id = ?"
+      parameters:
+        - name: status_code
+          generator:
+            type: custom
+            value: "active"  # Fixed value (auto-detects type)
+
+        - name: user_id
+          distribution:
+            type: uniform
+            range: [1, 10000]
+
+    # ========================================
+    # UUID generator
+    # ========================================
+    - name: insert_with_uuid
+      weight: 5
+      type: write
+      sql: "UPDATE users SET email = ? WHERE user_id = ?"
+      parameters:
+        - name: email
+          generator:
+            type: uuid  # Generates UUID-like string
+
+        - name: user_id
+          distribution:
+            type: sequential  # Sequential counter with wraparound
+            range: [1, 10000]
+
+    # ========================================================================
+    # 6. TRANSACTION OPERATIONS (MULTI-STATEMENT)
+    # ========================================================================
+    - name: transfer_balance
+      weight: 5
+      type: write
+      # Transaction operations - multiple SQL statements executed in a transaction
+      transaction_operations:
+        - name: debit
+          sql: "UPDATE users SET balance = balance - ? WHERE user_id = ?"
+          parameters:
+            - name: amount
+              generator:
+                type: decimal
+                range: [1, 100]
+                precision: 2
+            - name: from_user_id
+              distribution:
+                type: uniform
+                range: [1, 10000]
+
+        - name: credit
+          sql: "UPDATE users SET balance = balance + ? WHERE user_id = ?"
+          parameters:
+            - name: amount
+              generator:
+                type: decimal
+                range: [1, 100]
+                precision: 2
+            - name: to_user_id
+              distribution:
+                type: uniform
+                range: [1, 10000]
+
+# ============================================================================
+# 7. PARAMETER DISTRIBUTIONS - COMPLETE REFERENCE
+# ============================================================================
+#
+# Distributions determine how values are selected from a range:
+#
+# uniform:
+#   type: uniform
+#   range: [min, max]  # Equal probability for all values
+#
+# round_robin:
+#   type: round_robin
+#   range: [min, max]  # Cycles through values deterministically
+#
+# sequential:
+#   type: sequential
+#   range: [min, max]  # Counter that wraps around at max
+#
+# zipfian (or zipf):
+#   type: zipfian
+#   range: [min, max]  # Power-law distribution (hot keys)
+#                      # Heavily favors lower values
+#
+# gaussian (or normal):
+#   type: gaussian
+#   range: [min, max]  # Normal distribution
+#                      # Mean = (min+max)/2, stddev = (max-min)/6
+#
+# Range values support:
+#   - Integers: [1, 1000]
+#   - Strings: ["1", "1000"]
+#   - Variables: [1, "${row_count}"]
+
+# ============================================================================
+# 8. PARAMETER GENERATORS - COMPLETE REFERENCE
+# ============================================================================
+#
+# Generators create new values (not selected from a range):
+#
+# string (template-based):
+#   type: string
+#   template: "user_{iteration:0>10}"  # {iteration} and padding
+#
+# string (random):
+#   type: string
+#   length: 32  # Random alphanumeric string
+#
+# integer:
+#   type: integer
+#   range: [min, max]  # Random integer in range
+#
+# decimal (or float):
+#   type: decimal
+#   range: [min, max]
+#   precision: 2  # Number of decimal places
+#
+# choice:
+#   type: choice
+#   choices: ["option1", "option2", "option3"]  # Random pick
+#
+# custom:
+#   type: custom
+#   value: "42"  # Fixed value (auto-detects int/float/string)
+#
+# uuid:
+#   type: uuid  # Generates UUID-like string (xxxxxxxx-xxxx-xxxx-xxxx-xxxxxxxxxxxx)
+
+# ============================================================================
+# 9. VARIABLE SUBSTITUTION
+# ============================================================================
+#
+# Available variables in SQL and ranges:
+#   ${table_count} - Number of tables defined
+#   ${row_count}   - Number of rows per table
+#
+# Usage examples:
+#   sql: "SELECT * FROM users{table_id} WHERE id <= ${row_count}"
+#   range: [1, "${row_count}"]
+#
+# Special placeholders in SQL:
+#   {table_id}   - Replaced by table_id parameter value
+#   {iteration}  - Current iteration number in string templates
+#   {iteration:0>N} - Padded iteration (e.g., {iteration:0>10} → 0000000042)
+
+# ============================================================================
+# OVERRIDE SUPPORT (Applied at scenario level)
+# ============================================================================
+#
+# Scenario files can override workload parameters:
+#
+# scenario:
+#   workload:
+#     type: declarative
+#     file: workloads/example_all_features.yaml
+#     overrides:
+#       operations:
+#         - name: select_user_by_id
+#           weight: 90  # Override from 30 to 90
+#         - name: update_user_profile
+#           weight: 10  # Override from 15 to 10
+#       schema:
+#         tables:
+#           - count: 20        # Override table count
+#             row_count: 50000 # Override row count
+
+# ============================================================================
+# NOTES
+# ============================================================================
+#
+# 1. All parameters are optional except:
+#    - workload.name
+#    - workload.schema.tables (at least one table)
+#    - workload.operations (at least one operation)
+#
+# 2. For single operations, specify 'sql' and 'parameters'
+#    For transactions, use 'transaction_operations' instead
+#
+# 3. Distribution types work on ranges (selecting values)
+#    Generator types create new values
+#
+# 4. The prepare phase creates tables and loads data
+#    The cleanup phase can optionally drop tables
+#
+# 5. Operation weights are relative (not percentages)
+#    weight: 30 and weight: 70 = 30% and 70%
+#
+# 6. Data generation strategy applies during prepare phase
+#    Operation distributions apply during execution phase
+#
+# 7. Variables (${table_count}, ${row_count}) are computed
+#    from the first table definition
