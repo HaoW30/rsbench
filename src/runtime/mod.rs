@@ -12,7 +12,7 @@ use crate::config::RuntimeMode;
 use crate::metrics::MetricsCollector;
 use crate::pool::ConnectionPool;
 use crate::workload::Operation;
-use crate::{Result, RuntimeError};
+use crate::Result;
 use std::sync::Arc;
 use std::time::Duration;
 

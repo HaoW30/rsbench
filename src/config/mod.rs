@@ -64,24 +64,197 @@ impl ConfigLoader {
     }
 
     /// Validate configuration consistency
-    pub fn validate(_config: &ToolConfig) -> Result<()> {
-        // TODO: Implement validation logic
-        // - Check pool config constraints
-        // - Validate connection string format
-        // - Verify rate > 0
-        // - Check duration > 0
+    pub fn validate(config: &ToolConfig) -> Result<()> {
+        // Validate pool config constraints
+        if config.database.pool.min_size > config.database.pool.max_size {
+            return Err(Error::Config(format!(
+                "Pool min_size ({}) cannot be greater than max_size ({})",
+                config.database.pool.min_size, config.database.pool.max_size
+            )));
+        }
+
+        if config.database.pool.max_size == 0 {
+            return Err(Error::Config("Pool max_size must be greater than 0".into()));
+        }
+
+        // Validate connection string is not empty
+        if config.database.connection_string.trim().is_empty() {
+            return Err(Error::Config("Database connection string cannot be empty".into()));
+        }
+
+        // Basic connection string format validation
+        let conn_str = &config.database.connection_string;
+        if !conn_str.contains("://") {
+            return Err(Error::Config(format!(
+                "Invalid connection string format: '{}'. Expected format: driver://host/db",
+                conn_str
+            )));
+        }
+
+        // Validate runtime config
+        match &config.runtime.mode {
+            RuntimeMode::Async {
+                workers,
+                max_connections,
+                backpressure_threshold,
+            } => {
+                if *workers == 0 {
+                    return Err(Error::Config("Async runtime workers must be > 0".into()));
+                }
+                if *max_connections == 0 {
+                    return Err(Error::Config(
+                        "Async runtime max_connections must be > 0".into(),
+                    ));
+                }
+                if !(*backpressure_threshold >= 0.0 && *backpressure_threshold <= 1.0) {
+                    return Err(Error::Config(format!(
+                        "Backpressure threshold must be between 0.0 and 1.0, got {}",
+                        backpressure_threshold
+                    )));
+                }
+                // Check that max_connections doesn't exceed pool max_size
+                if *max_connections > config.database.pool.max_size {
+                    return Err(Error::Config(format!(
+                        "Runtime max_connections ({}) cannot exceed pool max_size ({})",
+                        max_connections, config.database.pool.max_size
+                    )));
+                }
+            }
+            RuntimeMode::Blocking { threads } => {
+                if *threads == 0 {
+                    return Err(Error::Config("Blocking runtime threads must be > 0".into()));
+                }
+            }
+        }
+
+        // Validate executor config
+        match &config.scenario.executor {
+            ExecutorConfig::ConstantRate {
+                rate,
+                duration,
+                max_connections,
+            } => {
+                if *rate == 0 {
+                    return Err(Error::Config("Executor rate must be > 0".into()));
+                }
+                if duration.as_secs() == 0 && duration.subsec_nanos() == 0 {
+                    return Err(Error::Config("Executor duration must be > 0".into()));
+                }
+                if *max_connections == 0 {
+                    return Err(Error::Config("Executor max_connections must be > 0".into()));
+                }
+            }
+            ExecutorConfig::RampingRate {
+                stages,
+                max_connections,
+                ..
+            } => {
+                if stages.is_empty() {
+                    return Err(Error::Config("Ramping executor must have at least one stage".into()));
+                }
+                for (i, stage) in stages.iter().enumerate() {
+                    if stage.target_rate == 0 {
+                        return Err(Error::Config(format!(
+                            "Stage {} target_rate must be > 0",
+                            i
+                        )));
+                    }
+                    if stage.duration.as_secs() == 0 && stage.duration.subsec_nanos() == 0 {
+                        return Err(Error::Config(format!("Stage {} duration must be > 0", i)));
+                    }
+                }
+                if *max_connections == 0 {
+                    return Err(Error::Config("Executor max_connections must be > 0".into()));
+                }
+            }
+        }
+
+        // Validate workload config
+        match &config.scenario.workload {
+            WorkloadConfig::Builtin {
+                name,
+                table_count,
+                table_size,
+            } => {
+                if name.is_empty() {
+                    return Err(Error::Config("Workload name cannot be empty".into()));
+                }
+                if *table_count == 0 {
+                    return Err(Error::Config("Workload table_count must be > 0".into()));
+                }
+                if *table_size == 0 {
+                    return Err(Error::Config("Workload table_size must be > 0".into()));
+                }
+            }
+            WorkloadConfig::Lua { script } => {
+                if script.as_os_str().is_empty() {
+                    return Err(Error::Config("Lua script path cannot be empty".into()));
+                }
+            }
+        }
+
         Ok(())
     }
 
     /// Merge CLI args with file config (precedence: CLI > file > defaults)
-    pub fn merge(file_config: ToolConfig, _cli_args: CliArgs) -> ToolConfig {
-        // TODO: Implement merge logic
+    pub fn merge(mut file_config: ToolConfig, cli_args: CliArgs) -> ToolConfig {
+        // Override database connection string if provided
+        if let Some(db_url) = cli_args.database_url {
+            file_config.database.connection_string = db_url;
+        }
+
+        // Override executor rate if provided (only for ConstantRate)
+        if let Some(rate) = cli_args.rate {
+            if let ExecutorConfig::ConstantRate {
+                rate: ref mut config_rate,
+                ..
+            } = file_config.scenario.executor
+            {
+                *config_rate = rate;
+            }
+        }
+
+        // Override executor duration if provided
+        if let Some(duration) = cli_args.duration {
+            match &mut file_config.scenario.executor {
+                ExecutorConfig::ConstantRate {
+                    duration: ref mut config_duration,
+                    ..
+                } => {
+                    *config_duration = duration;
+                }
+                ExecutorConfig::RampingRate { .. } => {
+                    // For ramping rate, we can't easily override duration
+                    // Could log a warning here in the future
+                }
+            }
+        }
+
+        // Override runtime threads if provided (only for Blocking mode)
+        if let Some(threads) = cli_args.threads {
+            if let RuntimeMode::Blocking {
+                threads: ref mut config_threads,
+            } = file_config.runtime.mode
+            {
+                *config_threads = threads;
+            }
+        }
+
+        // Override output format if provided
+        if let Some(format) = cli_args.output_format {
+            file_config.output.format = format;
+        }
+
         file_config
     }
 
     /// Apply default values to incomplete config
+    /// Note: Most defaults are already handled by serde defaults
+    /// This method is available for any additional normalization
     pub fn with_defaults(config: ToolConfig) -> ToolConfig {
-        // TODO: Apply defaults
+        // Serde already applies defaults via #[serde(default)] attributes
+        // This method can be used for additional runtime defaults or normalization
+        // For now, it's a passthrough as serde handles everything
         config
     }
 
@@ -727,5 +900,759 @@ output:
                 result.err()
             );
         }
+    }
+
+    // ========================================================================
+    // Validation Tests
+    // ========================================================================
+
+    #[test]
+    fn test_validate_pool_min_greater_than_max() {
+        let yaml = r#"
+database:
+  driver: mysql
+  connection_string: "mysql://localhost/test"
+  pool:
+    min_size: 100
+    max_size: 10
+
+runtime:
+  type: async
+  workers: 4
+  max_connections: 10
+  backpressure_threshold: 0.8
+
+scenario:
+  executor:
+    type: constant-rate
+    rate: 1000
+    duration: 60s
+    max_connections: 10
+  workload:
+    type: builtin
+    name: oltp_read_write
+
+output:
+  format: text
+"#;
+
+        let config = ConfigLoader::load(ConfigSource::Yaml(yaml.to_string())).unwrap();
+        let result = ConfigLoader::validate(&config);
+        assert!(result.is_err());
+        assert!(result
+            .unwrap_err()
+            .to_string()
+            .contains("min_size"));
+    }
+
+    #[test]
+    fn test_validate_pool_max_size_zero() {
+        let yaml = r#"
+database:
+  driver: mysql
+  connection_string: "mysql://localhost/test"
+  pool:
+    min_size: 0
+    max_size: 0
+
+runtime:
+  type: async
+  workers: 4
+  max_connections: 10
+  backpressure_threshold: 0.8
+
+scenario:
+  executor:
+    type: constant-rate
+    rate: 1000
+    duration: 60s
+    max_connections: 10
+  workload:
+    type: builtin
+    name: oltp_read_write
+
+output:
+  format: text
+"#;
+
+        let config = ConfigLoader::load(ConfigSource::Yaml(yaml.to_string())).unwrap();
+        let result = ConfigLoader::validate(&config);
+        assert!(result.is_err());
+        assert!(result
+            .unwrap_err()
+            .to_string()
+            .contains("max_size must be greater than 0"));
+    }
+
+    #[test]
+    fn test_validate_empty_connection_string() {
+        let yaml = r#"
+database:
+  driver: mysql
+  connection_string: ""
+
+runtime:
+  type: async
+  workers: 4
+  max_connections: 10
+  backpressure_threshold: 0.8
+
+scenario:
+  executor:
+    type: constant-rate
+    rate: 1000
+    duration: 60s
+    max_connections: 10
+  workload:
+    type: builtin
+    name: oltp_read_write
+
+output:
+  format: text
+"#;
+
+        let config = ConfigLoader::load(ConfigSource::Yaml(yaml.to_string())).unwrap();
+        let result = ConfigLoader::validate(&config);
+        assert!(result.is_err());
+        assert!(result
+            .unwrap_err()
+            .to_string()
+            .contains("connection string cannot be empty"));
+    }
+
+    #[test]
+    fn test_validate_invalid_connection_string_format() {
+        let yaml = r#"
+database:
+  driver: mysql
+  connection_string: "localhost"
+
+runtime:
+  type: async
+  workers: 4
+  max_connections: 10
+  backpressure_threshold: 0.8
+
+scenario:
+  executor:
+    type: constant-rate
+    rate: 1000
+    duration: 60s
+    max_connections: 10
+  workload:
+    type: builtin
+    name: oltp_read_write
+
+output:
+  format: text
+"#;
+
+        let config = ConfigLoader::load(ConfigSource::Yaml(yaml.to_string())).unwrap();
+        let result = ConfigLoader::validate(&config);
+        assert!(result.is_err());
+        assert!(result
+            .unwrap_err()
+            .to_string()
+            .contains("Invalid connection string format"));
+    }
+
+    #[test]
+    fn test_validate_async_workers_zero() {
+        let yaml = r#"
+database:
+  driver: mysql
+  connection_string: "mysql://localhost/test"
+
+runtime:
+  type: async
+  workers: 0
+  max_connections: 10
+  backpressure_threshold: 0.8
+
+scenario:
+  executor:
+    type: constant-rate
+    rate: 1000
+    duration: 60s
+    max_connections: 10
+  workload:
+    type: builtin
+    name: oltp_read_write
+
+output:
+  format: text
+"#;
+
+        let config = ConfigLoader::load(ConfigSource::Yaml(yaml.to_string())).unwrap();
+        let result = ConfigLoader::validate(&config);
+        assert!(result.is_err());
+        assert!(result
+            .unwrap_err()
+            .to_string()
+            .contains("workers must be > 0"));
+    }
+
+    #[test]
+    fn test_validate_backpressure_threshold_out_of_range() {
+        let yaml = r#"
+database:
+  driver: mysql
+  connection_string: "mysql://localhost/test"
+
+runtime:
+  type: async
+  workers: 4
+  max_connections: 10
+  backpressure_threshold: 1.5
+
+scenario:
+  executor:
+    type: constant-rate
+    rate: 1000
+    duration: 60s
+    max_connections: 10
+  workload:
+    type: builtin
+    name: oltp_read_write
+
+output:
+  format: text
+"#;
+
+        let config = ConfigLoader::load(ConfigSource::Yaml(yaml.to_string())).unwrap();
+        let result = ConfigLoader::validate(&config);
+        assert!(result.is_err());
+        assert!(result
+            .unwrap_err()
+            .to_string()
+            .contains("between 0.0 and 1.0"));
+    }
+
+    #[test]
+    fn test_validate_runtime_max_connections_exceeds_pool() {
+        let yaml = r#"
+database:
+  driver: mysql
+  connection_string: "mysql://localhost/test"
+  pool:
+    max_size: 10
+
+runtime:
+  type: async
+  workers: 4
+  max_connections: 100
+  backpressure_threshold: 0.8
+
+scenario:
+  executor:
+    type: constant-rate
+    rate: 1000
+    duration: 60s
+    max_connections: 10
+  workload:
+    type: builtin
+    name: oltp_read_write
+
+output:
+  format: text
+"#;
+
+        let config = ConfigLoader::load(ConfigSource::Yaml(yaml.to_string())).unwrap();
+        let result = ConfigLoader::validate(&config);
+        assert!(result.is_err());
+        assert!(result
+            .unwrap_err()
+            .to_string()
+            .contains("cannot exceed pool max_size"));
+    }
+
+    #[test]
+    fn test_validate_executor_rate_zero() {
+        let yaml = r#"
+database:
+  driver: mysql
+  connection_string: "mysql://localhost/test"
+
+runtime:
+  type: async
+  workers: 4
+  max_connections: 10
+  backpressure_threshold: 0.8
+
+scenario:
+  executor:
+    type: constant-rate
+    rate: 0
+    duration: 60s
+    max_connections: 10
+  workload:
+    type: builtin
+    name: oltp_read_write
+
+output:
+  format: text
+"#;
+
+        let config = ConfigLoader::load(ConfigSource::Yaml(yaml.to_string())).unwrap();
+        let result = ConfigLoader::validate(&config);
+        assert!(result.is_err());
+        assert!(result
+            .unwrap_err()
+            .to_string()
+            .contains("rate must be > 0"));
+    }
+
+    #[test]
+    fn test_validate_executor_duration_zero() {
+        let yaml = r#"
+database:
+  driver: mysql
+  connection_string: "mysql://localhost/test"
+
+runtime:
+  type: async
+  workers: 4
+  max_connections: 10
+  backpressure_threshold: 0.8
+
+scenario:
+  executor:
+    type: constant-rate
+    rate: 1000
+    duration: 0s
+    max_connections: 10
+  workload:
+    type: builtin
+    name: oltp_read_write
+
+output:
+  format: text
+"#;
+
+        let config = ConfigLoader::load(ConfigSource::Yaml(yaml.to_string())).unwrap();
+        let result = ConfigLoader::validate(&config);
+        assert!(result.is_err());
+        assert!(result
+            .unwrap_err()
+            .to_string()
+            .contains("duration must be > 0"));
+    }
+
+    #[test]
+    fn test_validate_ramping_empty_stages() {
+        let yaml = r#"
+database:
+  driver: mysql
+  connection_string: "mysql://localhost/test"
+
+runtime:
+  type: async
+  workers: 4
+  max_connections: 10
+  backpressure_threshold: 0.8
+
+scenario:
+  executor:
+    type: ramping-rate
+    stages: []
+    max_connections: 10
+  workload:
+    type: builtin
+    name: oltp_read_write
+
+output:
+  format: text
+"#;
+
+        let config = ConfigLoader::load(ConfigSource::Yaml(yaml.to_string())).unwrap();
+        let result = ConfigLoader::validate(&config);
+        assert!(result.is_err());
+        assert!(result
+            .unwrap_err()
+            .to_string()
+            .contains("at least one stage"));
+    }
+
+    #[test]
+    fn test_validate_workload_empty_name() {
+        let yaml = r#"
+database:
+  driver: mysql
+  connection_string: "mysql://localhost/test"
+
+runtime:
+  type: async
+  workers: 4
+  max_connections: 10
+  backpressure_threshold: 0.8
+
+scenario:
+  executor:
+    type: constant-rate
+    rate: 1000
+    duration: 60s
+    max_connections: 10
+  workload:
+    type: builtin
+    name: ""
+
+output:
+  format: text
+"#;
+
+        let config = ConfigLoader::load(ConfigSource::Yaml(yaml.to_string())).unwrap();
+        let result = ConfigLoader::validate(&config);
+        assert!(result.is_err());
+        assert!(result
+            .unwrap_err()
+            .to_string()
+            .contains("name cannot be empty"));
+    }
+
+    #[test]
+    fn test_validate_valid_config_passes() {
+        let yaml = r#"
+database:
+  driver: mysql
+  connection_string: "mysql://localhost/test"
+
+runtime:
+  type: async
+  workers: 4
+  max_connections: 10
+  backpressure_threshold: 0.8
+
+scenario:
+  executor:
+    type: constant-rate
+    rate: 1000
+    duration: 60s
+    max_connections: 10
+  workload:
+    type: builtin
+    name: oltp_read_write
+
+output:
+  format: text
+"#;
+
+        let config = ConfigLoader::load(ConfigSource::Yaml(yaml.to_string())).unwrap();
+        let result = ConfigLoader::validate(&config);
+        assert!(result.is_ok());
+    }
+
+    // ========================================================================
+    // Merge Tests
+    // ========================================================================
+
+    #[test]
+    fn test_merge_cli_overrides_database_url() {
+        let yaml = r#"
+database:
+  driver: mysql
+  connection_string: "mysql://localhost/test"
+
+runtime:
+  type: async
+  workers: 4
+  max_connections: 10
+  backpressure_threshold: 0.8
+
+scenario:
+  executor:
+    type: constant-rate
+    rate: 1000
+    duration: 60s
+    max_connections: 10
+  workload:
+    type: builtin
+    name: oltp_read_write
+
+output:
+  format: text
+"#;
+
+        let config = ConfigLoader::load(ConfigSource::Yaml(yaml.to_string())).unwrap();
+        let cli_args = CliArgs {
+            config_file: None,
+            database_url: Some("mysql://newhost/newdb".to_string()),
+            rate: None,
+            duration: None,
+            threads: None,
+            output_format: None,
+        };
+
+        let merged = ConfigLoader::merge(config, cli_args);
+        assert_eq!(merged.database.connection_string, "mysql://newhost/newdb");
+    }
+
+    #[test]
+    fn test_merge_cli_overrides_rate() {
+        let yaml = r#"
+database:
+  driver: mysql
+  connection_string: "mysql://localhost/test"
+
+runtime:
+  type: async
+  workers: 4
+  max_connections: 10
+  backpressure_threshold: 0.8
+
+scenario:
+  executor:
+    type: constant-rate
+    rate: 1000
+    duration: 60s
+    max_connections: 10
+  workload:
+    type: builtin
+    name: oltp_read_write
+
+output:
+  format: text
+"#;
+
+        let config = ConfigLoader::load(ConfigSource::Yaml(yaml.to_string())).unwrap();
+        let cli_args = CliArgs {
+            config_file: None,
+            database_url: None,
+            rate: Some(5000),
+            duration: None,
+            threads: None,
+            output_format: None,
+        };
+
+        let merged = ConfigLoader::merge(config, cli_args);
+        match merged.scenario.executor {
+            ExecutorConfig::ConstantRate { rate, .. } => {
+                assert_eq!(rate, 5000);
+            }
+            _ => panic!("Expected ConstantRate executor"),
+        }
+    }
+
+    #[test]
+    fn test_merge_cli_overrides_duration() {
+        let yaml = r#"
+database:
+  driver: mysql
+  connection_string: "mysql://localhost/test"
+
+runtime:
+  type: async
+  workers: 4
+  max_connections: 10
+  backpressure_threshold: 0.8
+
+scenario:
+  executor:
+    type: constant-rate
+    rate: 1000
+    duration: 60s
+    max_connections: 10
+  workload:
+    type: builtin
+    name: oltp_read_write
+
+output:
+  format: text
+"#;
+
+        let config = ConfigLoader::load(ConfigSource::Yaml(yaml.to_string())).unwrap();
+        let cli_args = CliArgs {
+            config_file: None,
+            database_url: None,
+            rate: None,
+            duration: Some(Duration::from_secs(120)),
+            threads: None,
+            output_format: None,
+        };
+
+        let merged = ConfigLoader::merge(config, cli_args);
+        match merged.scenario.executor {
+            ExecutorConfig::ConstantRate { duration, .. } => {
+                assert_eq!(duration, Duration::from_secs(120));
+            }
+            _ => panic!("Expected ConstantRate executor"),
+        }
+    }
+
+    #[test]
+    fn test_merge_cli_overrides_threads() {
+        let yaml = r#"
+database:
+  driver: mysql
+  connection_string: "mysql://localhost/test"
+
+runtime:
+  type: blocking
+  threads: 8
+
+scenario:
+  executor:
+    type: constant-rate
+    rate: 1000
+    duration: 60s
+    max_connections: 10
+  workload:
+    type: builtin
+    name: oltp_read_write
+
+output:
+  format: text
+"#;
+
+        let config = ConfigLoader::load(ConfigSource::Yaml(yaml.to_string())).unwrap();
+        let cli_args = CliArgs {
+            config_file: None,
+            database_url: None,
+            rate: None,
+            duration: None,
+            threads: Some(16),
+            output_format: None,
+        };
+
+        let merged = ConfigLoader::merge(config, cli_args);
+        match merged.runtime.mode {
+            RuntimeMode::Blocking { threads } => {
+                assert_eq!(threads, 16);
+            }
+            _ => panic!("Expected Blocking runtime"),
+        }
+    }
+
+    #[test]
+    fn test_merge_cli_overrides_output_format() {
+        let yaml = r#"
+database:
+  driver: mysql
+  connection_string: "mysql://localhost/test"
+
+runtime:
+  type: async
+  workers: 4
+  max_connections: 10
+  backpressure_threshold: 0.8
+
+scenario:
+  executor:
+    type: constant-rate
+    rate: 1000
+    duration: 60s
+    max_connections: 10
+  workload:
+    type: builtin
+    name: oltp_read_write
+
+output:
+  format: text
+"#;
+
+        let config = ConfigLoader::load(ConfigSource::Yaml(yaml.to_string())).unwrap();
+        let cli_args = CliArgs {
+            config_file: None,
+            database_url: None,
+            rate: None,
+            duration: None,
+            threads: None,
+            output_format: Some(OutputFormat::Json),
+        };
+
+        let merged = ConfigLoader::merge(config, cli_args);
+        assert!(matches!(merged.output.format, OutputFormat::Json));
+    }
+
+    #[test]
+    fn test_merge_multiple_cli_overrides() {
+        let yaml = r#"
+database:
+  driver: mysql
+  connection_string: "mysql://localhost/test"
+
+runtime:
+  type: async
+  workers: 4
+  max_connections: 10
+  backpressure_threshold: 0.8
+
+scenario:
+  executor:
+    type: constant-rate
+    rate: 1000
+    duration: 60s
+    max_connections: 10
+  workload:
+    type: builtin
+    name: oltp_read_write
+
+output:
+  format: text
+"#;
+
+        let config = ConfigLoader::load(ConfigSource::Yaml(yaml.to_string())).unwrap();
+        let cli_args = CliArgs {
+            config_file: None,
+            database_url: Some("mysql://cli/db".to_string()),
+            rate: Some(2000),
+            duration: Some(Duration::from_secs(30)),
+            threads: None,
+            output_format: Some(OutputFormat::Json),
+        };
+
+        let merged = ConfigLoader::merge(config, cli_args);
+        assert_eq!(merged.database.connection_string, "mysql://cli/db");
+        assert!(matches!(merged.output.format, OutputFormat::Json));
+        match merged.scenario.executor {
+            ExecutorConfig::ConstantRate { rate, duration, .. } => {
+                assert_eq!(rate, 2000);
+                assert_eq!(duration, Duration::from_secs(30));
+            }
+            _ => panic!("Expected ConstantRate executor"),
+        }
+    }
+
+    #[test]
+    fn test_merge_no_cli_overrides_preserves_config() {
+        let yaml = r#"
+database:
+  driver: mysql
+  connection_string: "mysql://localhost/test"
+
+runtime:
+  type: async
+  workers: 4
+  max_connections: 10
+  backpressure_threshold: 0.8
+
+scenario:
+  executor:
+    type: constant-rate
+    rate: 1000
+    duration: 60s
+    max_connections: 10
+  workload:
+    type: builtin
+    name: oltp_read_write
+
+output:
+  format: text
+"#;
+
+        let config = ConfigLoader::load(ConfigSource::Yaml(yaml.to_string())).unwrap();
+        let original_conn_str = config.database.connection_string.clone();
+
+        let cli_args = CliArgs {
+            config_file: None,
+            database_url: None,
+            rate: None,
+            duration: None,
+            threads: None,
+            output_format: None,
+        };
+
+        let merged = ConfigLoader::merge(config, cli_args);
+        assert_eq!(merged.database.connection_string, original_conn_str);
+        assert!(matches!(merged.output.format, OutputFormat::Text));
     }
 }
