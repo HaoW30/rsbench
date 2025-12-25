@@ -11,31 +11,37 @@ use std::time::Duration;
 #[command(version = env!("CARGO_PKG_VERSION"))]
 #[command(about = "Modern database testing tool", long_about = None)]
 pub struct Cli {
-    /// Configuration file path
+    /// Infrastructure configuration file (database, runtime, pool settings)
+    /// Default: config/rsbench.config.yaml
     #[arg(short, long)]
     pub config: Option<PathBuf>,
 
-    /// Database connection string
+    /// Scenario file (workload, executor, test parameters)
+    /// Defines what test to run
+    #[arg(short, long)]
+    pub scenario: Option<PathBuf>,
+
+    /// Database connection string (overrides config file)
     #[arg(long)]
     pub db_url: Option<String>,
 
-    /// Target rate (ops/sec)
+    /// Target rate (ops/sec) (overrides scenario file)
     #[arg(long)]
     pub rate: Option<u64>,
 
-    /// Test duration
+    /// Test duration (overrides scenario file)
     #[arg(long, value_parser = parse_duration)]
     pub duration: Option<Duration>,
 
-    /// Number of threads (blocking mode)
+    /// Number of threads (blocking mode) (overrides config file)
     #[arg(long)]
     pub threads: Option<usize>,
 
-    /// Output format (text|json)
+    /// Output format (text|json) (overrides config/scenario file)
     #[arg(long)]
     pub output: Option<String>,
 
-    /// Determinism seed
+    /// Determinism seed (overrides scenario file)
     #[arg(long)]
     pub seed: Option<u64>,
 

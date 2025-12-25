@@ -24,7 +24,9 @@ pub mod scenario;
 pub mod cli;
 
 // Re-export commonly used types
-pub use config::{ConfigLoader, ConfigSource, ToolConfig};
+pub use config::{
+    ConfigLoader, ConfigSource, ToolConfig, InfrastructureConfig, ScenarioFile,
+};
 pub use workload::{Workload, WorkloadFactory, Operation};
 pub use runtime::{RuntimeEngine, RuntimeFactory};
 pub use metrics::{MetricsCollector, MetricsSnapshot};
