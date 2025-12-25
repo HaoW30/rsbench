@@ -180,49 +180,61 @@ pub async fn execute(&mut self) -> Result<Vec<ScenarioResult>> {
 ```
 ┌─────────────────────────────────────────────────────────────┐
 │                         CLI Module                          │
-│  Parse args, load config, init system                      │
+│  Parse args, load infrastructure config + scenario         │
 └────────────────────────────┬────────────────────────────────┘
                              │
                              ▼
 ┌─────────────────────────────────────────────────────────────┐
 │                     Config Module                           │
-│  Config validation, defaults, types                         │
+│  InfrastructureConfig (config/) + ScenarioFile (scenarios/) │
+│  Declarative workload loading (workloads/)                  │
 └──────┬──────────────────────┬───────────────────────────────┘
        │                      │
        ▼                      ▼
-┌──────────────┐      ┌──────────────────────┐
-│   Workload   │      │   Scenario Module    │
-│    Module    │◄─────│  (Orchestrator)      │
-└──────┬───────┘      └──────┬───────────────┘
-       │                     │
-       │                     ▼
-       │              ┌──────────────────────┐
-       │              │  Rate Limiter Module │  ← TIME CONTROL
-       │              └──────────────────────┘
-       │                     │
-       │                     ▼
-       │              ┌──────────────────────┐
-       │              │   Runtime Module     │
-       │              │  (Async/Blocking)    │
-       └──────────────┤                      │
-                      └──────┬───────────────┘
-                             │
-                             ▼
-                      ┌──────────────────────┐
-                      │ Connection Pool      │
-                      │     Module           │
-                      └──────┬───────────────┘
-                             │
-                             ▼
-                      ┌──────────────────────┐
-                      │  Driver Module       │
-                      │  (MySQL/Postgres)    │
-                      └──────┬───────────────┘
-                             │
-                             ▼
-                      [    Database    ]
+┌──────────────────┐   ┌──────────────────────┐
+│ Workload Module  │   │   Scenario Module    │
+│ DeclarativeWL    │◄──│  (Orchestrator)      │
+│ LuaWL (optional) │   │  HOW/WHEN to execute │
+│ WHAT operations  │   └──────┬───────────────┘
+└──────────────────┘          │
+                              ▼
+                       ┌──────────────────────┐
+                       │  Rate Limiter Module │  ← TIME CONTROL
+                       └──────────────────────┘
+                              │
+                              ▼
+                       ┌──────────────────────┐
+                       │   Runtime Module     │
+                       │  (Async/Blocking)    │
+                       └──────┬───────────────┘
+                              │
+                              ▼
+                       ┌──────────────────────┐
+                       │ Connection Pool      │
+                       │     Module           │
+                       └──────┬───────────────┘
+                              │
+                              ▼
+                       ┌──────────────────────┐
+                       │  Driver Module       │
+                       │  (MySQL/Postgres)    │
+                       └──────┬───────────────┘
+                              │
+                              ▼
+                       [    Database    ]
 
 [Parallel: Metrics Module, Event Module]
+
+┌─────────────────────────────────────────────────────────────┐
+│                     Directory Structure                     │
+│                                                              │
+│  config/              - Infrastructure configs (DB, runtime)│
+│  scenarios/           - Test scenarios (executor, workload) │
+│  workloads/           - Declarative YAML workloads          │
+│                                                              │
+│  Separation: Same workload → different rates/durations      │
+│              Same scenario → different DB environments      │
+└─────────────────────────────────────────────────────────────┘
 ```
 
 ### Execution Flow (Time-Driven)
@@ -265,12 +277,188 @@ ScenarioExecutor::execute()
 - **Critical**: Immutable after loading, strong typing prevents invalid states
 
 ### 2. Workload Module (`src/workload/`)
+
+**Purpose**: Generate database operations - the "WHAT" of testing
+
 - **Trait**: `Workload` - all workload types implement this
 - **Implementations**:
-  - `OltpReadWrite` (builtin, sysbench equivalent)
-  - `LuaWorkload` (optional, feature-gated)
+  - `DeclarativeWorkload` (PRIMARY - YAML-based, transparent, fully configurable)
+  - `LuaWorkload` (for complex scenarios, optional, feature-gated)
+  - `OltpReadWrite` (DEPRECATED - use declarative workloads instead)
 - **Key Method**: `next_operation(&mut self, ctx: &ExecutionContext) -> Result<Operation>`
 - **Critical**: Must be deterministic (same ExecutionContext → same Operation)
+
+#### Workload vs Scenario (CRITICAL DISTINCTION)
+
+**Workload = WHAT operations to run**
+- Defines the business logic (SQL queries, transactions)
+- Generates operation parameters (which IDs, which tables)
+- Controls data distribution (uniform, zipfian, etc.)
+- Manages schema (table definitions, columns, indexes)
+- Is deterministic (same seed → same operations)
+
+**Scenario = HOW/WHEN to execute**
+- Controls execution lifecycle (prepare → run → cleanup)
+- Manages execution rate (1000 ops/sec, ramping, etc.)
+- Controls duration and stages
+- Manages connections and runtime
+- Coordinates timing across workers
+
+**Analogy**: Workload is the CHEF (decides what to cook), Scenario is the MANAGER (decides when to cook, how fast to serve)
+
+**Example**:
+```yaml
+# scenarios/my_test.yaml
+scenario:
+  executor:              # ← SCENARIO controls HOW/WHEN
+    type: constant-rate
+    rate: 1000          # Execute at 1000 ops/sec
+    duration: 60s       # For 60 seconds
+
+  workload:             # ← WORKLOAD controls WHAT
+    type: declarative
+    file: workloads/oltp_read_write.yaml  # Use this WHAT
+```
+
+The same workload can run in multiple scenarios:
+- Development: 100 ops/sec for 10s (quick smoke test)
+- Staging: 1000 ops/sec for 60s (standard test)
+- Production: 10000 ops/sec for 300s (capacity test)
+
+#### Declarative Workload Design
+
+**Primary Format**: YAML files in `workloads/` directory
+
+**Key Benefits**:
+1. **Transparency**: Users see exactly what operations are executed
+2. **Configurability**: Every aspect is customizable (schema, SQL, distributions)
+3. **No Code Required**: Create workloads without writing Rust
+4. **Version Control**: Workloads are text files, easy to diff and review
+5. **Sysbench Compatibility**: Full feature parity with all sysbench parameters
+
+**Workload Structure**:
+```yaml
+workload:
+  name: my_workload
+  description: "Optional description"
+
+  # Schema definition
+  schema:
+    tables:
+      - name: sbtest
+        count: 10              # Creates sbtest1..sbtest10
+        row_count: 10000       # Rows per table
+        columns:
+          - name: id
+            type: INT
+            primary_key: true
+          - name: k
+            type: INT
+            index: k_idx
+          - name: c
+            type: CHAR(120)
+
+  # Operations with weights
+  operations:
+    - name: point_select
+      weight: 60              # 60% of operations
+      type: read
+      sql: "SELECT c FROM sbtest{table_id} WHERE id = ?"
+      parameters:
+        - name: table_id
+          distribution:
+            type: round_robin
+            range: [1, "${table_count}"]
+        - name: id
+          distribution:
+            type: uniform
+            range: [1, "${row_count}"]
+
+    - name: update_non_index
+      weight: 40              # 40% of operations
+      type: write
+      sql: "UPDATE sbtest{table_id} SET c = ? WHERE id = ?"
+      parameters:
+        - name: table_id
+          distribution:
+            type: round_robin
+            range: [1, "${table_count}"]
+        - name: c
+          generator:
+            type: string
+            template: "{iteration:0>120}"
+        - name: id
+          distribution:
+            type: uniform
+            range: [1, "${row_count}"]
+```
+
+**Built-in Declarative Workloads**:
+- `workloads/oltp_read_write.yaml` - Balanced 60/40 read/write (default sysbench)
+- `workloads/oltp_read_only.yaml` - Read-only queries (various SELECT patterns)
+- `workloads/oltp_write_only.yaml` - Write-only (UPDATE, DELETE, INSERT)
+- `workloads/oltp_point_select.yaml` - Pure point select (100% reads)
+
+**Distribution Strategies**:
+- `uniform` - Random uniform distribution
+- `round_robin` - Deterministic round-robin (for table selection)
+- `zipfian` - Zipfian distribution (hot keys)
+- `gaussian` - Normal distribution
+- `sequential` - Sequential access
+
+**Parameter Generators**:
+- `integer` - Integer values from distribution
+- `string` - String generation with templates
+- `decimal` - Decimal/float values
+- `choice` - Pick from predefined list
+
+**Overriding Workload Parameters**:
+```yaml
+# scenarios/custom_test.yaml
+scenario:
+  workload:
+    type: declarative
+    file: workloads/oltp_read_write.yaml
+    overrides:
+      schema:
+        tables:
+          - count: 20          # Override: 20 tables instead of 10
+            row_count: 100000  # Override: 100k rows instead of 10k
+      operations:
+        - name: point_select
+          weight: 90          # Override: 90% reads instead of 60%
+        - name: update_non_index
+          weight: 10          # Override: 10% writes instead of 40%
+```
+
+**Migration from Builtin to Declarative**:
+
+❌ **Old (Deprecated)**:
+```yaml
+workload:
+  type: builtin
+  name: oltp_read_write
+  table_count: 10
+  table_size: 10000
+```
+
+✅ **New (Recommended)**:
+```yaml
+workload:
+  type: declarative
+  file: workloads/oltp_read_write.yaml
+  overrides:
+    schema:
+      tables:
+        - count: 10
+          row_count: 10000
+```
+
+**When to Use Lua vs Declarative**:
+- **Declarative**: 80% of use cases (standard OLTP patterns, custom queries)
+- **Lua**: Complex scenarios (conditional logic, stateful transactions, advanced correlation)
+
+See `docs/workload-design.md` for complete specification.
 
 ### 3. Rate Limiter Module (`src/rate_limiter.rs`)
 - **Algorithm**: Token bucket
@@ -327,13 +515,25 @@ ScenarioExecutor::execute()
 - ✅ Async runtime with backpressure monitoring
 - ✅ MySQL driver
 - ✅ HDR histogram metrics
+- ✅ Declarative workload design (YAML format defined)
+- ✅ All sysbench OLTP tests as YAML files
+- ✅ Configuration separation (infrastructure vs scenarios)
 - ✅ Sysbench Lua compatibility (structure)
+- 🚧 DeclarativeWorkload implementation (design complete, code pending)
 - 🚧 Text and JSON output (structure complete)
 - 🚧 OLTP workload data loading
 - 🚧 Full connection pooling
 
+**Recent Progress**:
+- ✅ Designed and documented declarative workload system
+- ✅ Created 4 declarative YAML workloads (oltp_read_write, oltp_read_only, oltp_write_only, oltp_point_select)
+- ✅ Migrated all scenarios to use declarative format
+- ✅ Added comprehensive unit tests (109 tests passing)
+- ✅ Fully implemented config module with validation and merging
+- ✅ Fully implemented CLI module with config loading
+
 **Success Criteria**:
-- [ ] Can run sysbench oltp_read_write equivalent
+- [ ] Can run sysbench oltp_read_write equivalent (workload design ready, implementation pending)
 - [x] Rate-based execution maintains target QPS (implemented)
 - [x] Backpressure visible in metrics (implemented)
 - [x] No coordinated omission (design prevents)
@@ -429,7 +629,89 @@ ScenarioExecutor::execute()
 
 ## Common Patterns
 
-### Creating a New Workload
+### Creating a New Workload (Declarative - Recommended)
+
+**Step 1**: Create YAML file in `workloads/` directory
+```yaml
+# workloads/my_app.yaml
+workload:
+  name: my_application
+  description: "Custom workload for my application"
+
+  schema:
+    tables:
+      - name: users
+        count: 1
+        row_count: 100000
+        columns:
+          - name: user_id
+            type: INT
+            primary_key: true
+          - name: email
+            type: VARCHAR(255)
+            index: email_idx
+          - name: created_at
+            type: TIMESTAMP
+
+  operations:
+    - name: get_user_by_id
+      weight: 70
+      type: read
+      sql: "SELECT * FROM users WHERE user_id = ?"
+      parameters:
+        - name: user_id
+          distribution:
+            type: uniform
+            range: [1, 100000]
+
+    - name: update_email
+      weight: 20
+      type: write
+      sql: "UPDATE users SET email = ? WHERE user_id = ?"
+      parameters:
+        - name: email
+          generator:
+            type: string
+            template: "user{iteration}@example.com"
+        - name: user_id
+          distribution:
+            type: uniform
+            range: [1, 100000]
+
+    - name: find_by_email
+      weight: 10
+      type: read
+      sql: "SELECT * FROM users WHERE email = ?"
+      parameters:
+        - name: email
+          generator:
+            type: string
+            template: "user{iteration}@example.com"
+```
+
+**Step 2**: Use in scenario
+```yaml
+# scenarios/my_test.yaml
+scenario:
+  executor:
+    type: constant-rate
+    rate: 1000
+    duration: 60s
+
+  workload:
+    type: declarative
+    file: workloads/my_app.yaml
+```
+
+**Step 3**: Run
+```bash
+rsbench --scenario scenarios/my_test.yaml
+```
+
+### Creating a New Workload (Rust - For Complex Scenarios)
+
+**Only needed when declarative YAML is insufficient (e.g., complex stateful logic)**
+
 ```rust
 pub struct MyWorkload {
     rng: ChaCha8Rng,
@@ -505,6 +787,11 @@ match &self.config.executor {
 - **API Spec**: `docs/api_spec_m0.md` - Detailed API specification
 - **Structure**: `docs/project_structure.md` - Module organization
 - **Progress**: `docs/m0_progress_summary.md` - Current status
+- **Workload Design**: `docs/workload-design.md` - Declarative workload specification
+- **Migration Guide**: `docs/declarative-workload-migration.md` - Builtin to declarative migration
+- **Config Guide**: `config/README.md` - Infrastructure configuration guide
+- **Scenario Guide**: `scenarios/README.md` - Test scenario guide
+- **Workload Guide**: `workloads/README.md` - Workload creation guide
 
 ## Quick Commands
 
@@ -574,6 +861,14 @@ Or install LuaJIT and build with: `cargo build --features lua`
 8. **Test determinism** - Property tests are essential
 9. **Optimize hot paths** - Profile before optimizing elsewhere
 10. **Simple > Clever** - Obvious code beats clever code every time
+11. **Declarative-First for Workloads** - Use YAML for workloads unless you need complex logic (then use Lua). Don't create Rust workloads unless absolutely necessary.
+12. **Workload vs Scenario** - NEVER confuse these:
+    - Workload = WHAT operations (SQL, parameters, distributions)
+    - Scenario = HOW/WHEN (rate, duration, executor type)
+    - Same workload can run at different rates/durations
+    - Same scenario can run against different databases
+13. **Configuration Separation** - NEVER mix infrastructure config (database, runtime) with scenario config (workload, executor)
+14. **Builtin workloads are DEPRECATED** - Always migrate to declarative YAML format. See `docs/declarative-workload-migration.md`
 
 ---
 

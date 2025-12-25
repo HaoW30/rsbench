@@ -171,11 +171,40 @@ impl ConfigLoader {
 
         // Validate workload config
         match &config.scenario.workload {
+            WorkloadConfig::Declarative {
+                file,
+                definition,
+                overrides: _,
+            } => {
+                // Must have either file or inline definition
+                if file.is_none() && definition.is_none() {
+                    return Err(Error::Config(
+                        "Declarative workload must specify either 'file' or 'definition'".into(),
+                    ));
+                }
+                // If file is specified, ensure it's not empty
+                if let Some(f) = file {
+                    if f.as_os_str().is_empty() {
+                        return Err(Error::Config(
+                            "Declarative workload file path cannot be empty".into(),
+                        ));
+                    }
+                }
+            }
+            WorkloadConfig::Lua { script } => {
+                if script.as_os_str().is_empty() {
+                    return Err(Error::Config("Lua script path cannot be empty".into()));
+                }
+            }
+            #[allow(deprecated)]
             WorkloadConfig::Builtin {
                 name,
                 table_count,
                 table_size,
             } => {
+                eprintln!(
+                    "Warning: Builtin workloads are deprecated. Use declarative workloads instead."
+                );
                 if name.is_empty() {
                     return Err(Error::Config("Workload name cannot be empty".into()));
                 }
@@ -184,11 +213,6 @@ impl ConfigLoader {
                 }
                 if *table_size == 0 {
                     return Err(Error::Config("Workload table_size must be > 0".into()));
-                }
-            }
-            WorkloadConfig::Lua { script } => {
-                if script.as_os_str().is_empty() {
-                    return Err(Error::Config("Lua script path cannot be empty".into()));
                 }
             }
         }
@@ -487,11 +511,41 @@ pub struct RateStage {
     pub target_rate: u64,
 }
 
-/// Workload configuration (M0: builtin or Lua)
+/// Workload configuration
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(tag = "type", rename_all = "lowercase")]
 pub enum WorkloadConfig {
-    /// Built-in OLTP workload
+    /// Declarative workload (YAML-based, recommended)
+    /// This is the primary workload format supporting all sysbench features
+    Declarative {
+        /// Path to declarative workload YAML file
+        /// Example: workloads/oltp_read_write.yaml
+        #[serde(default)]
+        file: Option<PathBuf>,
+
+        /// Inline workload definition (alternative to file)
+        #[serde(default)]
+        definition: Option<serde_yaml::Value>,
+
+        /// Overrides for specific workload parameters
+        /// Allows customizing pre-defined workloads without editing the file
+        #[serde(default)]
+        overrides: Option<serde_yaml::Value>,
+    },
+
+    /// Lua script (for complex custom workloads)
+    Lua {
+        /// Path to Lua script file
+        script: PathBuf,
+    },
+
+    /// Built-in OLTP workload (DEPRECATED - use declarative instead)
+    /// This will be removed in a future version
+    /// Migrate to: workloads/oltp_read_write.yaml
+    #[deprecated(
+        since = "0.2.0",
+        note = "Use declarative workloads instead. See workloads/oltp_*.yaml"
+    )]
     Builtin {
         name: String, // "oltp_read_write"
         #[serde(default = "default_table_count")]
@@ -499,8 +553,6 @@ pub enum WorkloadConfig {
         #[serde(default = "default_table_size")]
         table_size: usize,
     },
-    /// Lua script (sysbench compatible)
-    Lua { script: PathBuf },
 }
 
 fn default_table_count() -> usize {
@@ -815,9 +867,10 @@ output:
             scenario_file.scenario.executor,
             ExecutorConfig::ConstantRate { .. }
         ));
+        // Smoke test now uses declarative workload format
         assert!(matches!(
             scenario_file.scenario.workload,
-            WorkloadConfig::Builtin { .. }
+            WorkloadConfig::Declarative { .. }
         ));
     }
 

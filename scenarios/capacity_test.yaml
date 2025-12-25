@@ -23,10 +23,13 @@ scenario:
     max_connections: 200
 
   workload:
-    type: builtin
-    name: oltp_read_write
-    table_count: 10
-    table_size: 50000
+    type: declarative
+    file: workloads/oltp_read_write.yaml
+    overrides:
+      schema:
+        tables:
+          - count: 10
+            row_count: 50000  # Medium dataset for capacity testing
 
 determinism:
   seed: 42

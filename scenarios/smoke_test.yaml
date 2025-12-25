@@ -11,10 +11,13 @@ scenario:
     max_connections: 10
 
   workload:
-    type: builtin
-    name: oltp_read_write
-    table_count: 1
-    table_size: 1000    # Small dataset
+    type: declarative
+    file: workloads/oltp_point_select.yaml  # Simple read-only for smoke test
+    overrides:
+      schema:
+        tables:
+          - count: 1
+            row_count: 1000    # Small dataset for quick test
 
 determinism:
   seed: 42

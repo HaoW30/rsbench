@@ -1,0 +1,47 @@
+# OLTP Point Select Workload
+#
+# Sysbench equivalent: oltp_point_select.lua
+# Pure point select workload (100% reads)
+
+workload:
+  name: oltp_point_select
+  description: "Point select only workload (100% reads)"
+
+  schema:
+    tables:
+      - name: sbtest
+        count: 10
+        row_count: 10000
+        columns:
+          - name: id
+            type: INT
+            primary_key: true
+          - name: k
+            type: INT
+            default: 0
+            index: k_idx
+          - name: c
+            type: CHAR(120)
+            default: ""
+          - name: pad
+            type: CHAR(60)
+            default: ""
+
+  data_generation:
+    strategy: uniform
+
+  operations:
+    # Point select - 100%
+    - name: point_select
+      weight: 100
+      type: read
+      sql: "SELECT c FROM sbtest{table_id} WHERE id = ?"
+      parameters:
+        - name: table_id
+          distribution:
+            type: round_robin
+            range: [1, "${table_count}"]
+        - name: id
+          distribution:
+            type: uniform
+            range: [1, "${row_count}"]

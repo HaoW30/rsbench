@@ -99,6 +99,71 @@ rsbench --config config/rsbench.config.prod.yaml --scenario scenarios/smoke_test
 
 See `config/README.md` and `scenarios/README.md` for detailed documentation.
 
+### Customizing Workloads
+
+RSBench uses **declarative YAML workloads** that are fully transparent and configurable:
+
+**Use pre-defined workloads:**
+```yaml
+# scenarios/my_test.yaml
+scenario:
+  executor:
+    type: constant-rate
+    rate: 1000
+    duration: 60s
+
+  workload:
+    type: declarative
+    file: workloads/oltp_read_write.yaml  # Use built-in workload
+```
+
+**Customize operation distribution:**
+```yaml
+# Override to 90% reads, 10% writes
+scenario:
+  workload:
+    type: declarative
+    file: workloads/oltp_read_write.yaml
+    overrides:
+      operations:
+        - name: point_select
+          weight: 90
+        - name: update_non_index
+          weight: 10
+```
+
+**Create custom workloads:**
+```yaml
+# workloads/my_app.yaml
+workload:
+  name: my_application
+
+  schema:
+    tables:
+      - name: users
+        count: 1
+        row_count: 100000
+        columns:
+          - name: user_id
+            type: INT
+            primary_key: true
+          - name: email
+            type: VARCHAR(255)
+
+  operations:
+    - name: get_user
+      weight: 70
+      type: read
+      sql: "SELECT * FROM users WHERE user_id = ?"
+      parameters:
+        - name: user_id
+          distribution:
+            type: uniform
+            range: [1, 100000]
+```
+
+See `workloads/README.md` for the complete guide to creating custom workloads.
+
 <!-- Detailed API documentation coming soon -->
 
 ## Architecture
@@ -108,11 +173,26 @@ RSBench is built around several key components:
 - **Scenario Orchestrator**: Time-driven execution with rate control
 - **Dual-Mode Runtime**: Async (primary) and blocking (sysbench compatibility)
 - **Connection Pool**: Backpressure-aware with multi-endpoint routing
-- **Workload Engine**: Declarative YAML or programmable Lua
+- **Declarative Workload Engine**: Transparent YAML workloads with full sysbench compatibility
+- **Lua Workload Engine**: Programmable workloads for complex scenarios
 - **Metrics Engine**: HDR histograms with multiple output formats
 - **Event Integration**: K8s events, webhooks, lifecycle testing
 
-See the [Architecture Documentation](docs/architecture.md) for details.
+### Key Architectural Decisions
+
+**Workload vs Scenario Separation:**
+- **Workload** = WHAT operations to run (SQL generation, data distribution)
+- **Scenario** = HOW/WHEN to run (execution lifecycle, rate control, duration)
+
+This separation allows the same workload to run at different rates, durations, and against different databases.
+
+**Declarative-First Design:**
+- All sysbench OLTP tests are now transparent YAML files in `workloads/`
+- Full control over schema, operations, data distributions, and parameters
+- No code changes needed to customize workloads
+- Lua scripts available for complex scenarios that need programmability
+
+See the [Architecture Documentation](docs/architecture.md) and [Workload Design](docs/workload-design.md) for details.
 
 ## Roadmap
 
@@ -158,7 +238,11 @@ Monitoring integrations, web interface, and industry-standard benchmark suites
 | Multi-Region | No | Yes |
 | Test-as-Code | No | Yes (YAML/TOML) |
 | Lifecycle Testing | No | Yes (K8s events) |
-| Sysbench Compatibility | N/A | Yes (Lua scripts) |
+| Workload Definition | Hardcoded Lua | Declarative YAML + Lua |
+| Workload Transparency | Black box | Fully visible/editable |
+| OLTP Tests | Built-in binary | YAML files (user-modifiable) |
+| Custom Workloads | Write Lua | Write YAML (or Lua) |
+| Sysbench Compatibility | N/A | 100% (all parameters exposed) |
 
 ## Contributing
 

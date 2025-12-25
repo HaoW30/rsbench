@@ -1,0 +1,113 @@
+# OLTP Write-Only Workload
+#
+# Sysbench equivalent: oltp_write_only.lua
+# Write-only workload with updates, deletes, and inserts
+#
+# Default distribution (per transaction in sysbench):
+#   - 1 update on indexed column
+#   - 1 update on non-indexed column
+#   - 1 delete + 1 insert (delete-insert pair)
+
+workload:
+  name: oltp_write_only
+  description: "Write-only OLTP workload with updates, deletes, and inserts"
+
+  schema:
+    tables:
+      - name: sbtest
+        count: 10
+        row_count: 10000
+        columns:
+          - name: id
+            type: INT
+            primary_key: true
+          - name: k
+            type: INT
+            default: 0
+            index: k_idx
+          - name: c
+            type: CHAR(120)
+            default: ""
+          - name: pad
+            type: CHAR(60)
+            default: ""
+
+  data_generation:
+    strategy: uniform
+
+  operations:
+    # Update indexed column (k) - 30%
+    - name: update_index
+      weight: 30
+      type: write
+      sql: "UPDATE sbtest{table_id} SET k = k + 1 WHERE id = ?"
+      parameters:
+        - name: table_id
+          distribution:
+            type: round_robin
+            range: [1, "${table_count}"]
+        - name: id
+          distribution:
+            type: uniform
+            range: [1, "${row_count}"]
+
+    # Update non-indexed column (c) - 30%
+    - name: update_non_index
+      weight: 30
+      type: write
+      sql: "UPDATE sbtest{table_id} SET c = ? WHERE id = ?"
+      parameters:
+        - name: table_id
+          distribution:
+            type: round_robin
+            range: [1, "${table_count}"]
+        - name: c
+          generator:
+            type: string
+            template: "{iteration:0>120}"
+        - name: id
+          distribution:
+            type: uniform
+            range: [1, "${row_count}"]
+
+    # Delete - 20%
+    - name: delete
+      weight: 20
+      type: write
+      sql: "DELETE FROM sbtest{table_id} WHERE id = ?"
+      parameters:
+        - name: table_id
+          distribution:
+            type: round_robin
+            range: [1, "${table_count}"]
+        - name: id
+          distribution:
+            type: uniform
+            range: [1, "${row_count}"]
+
+    # Insert - 20% (to balance deletes)
+    - name: insert
+      weight: 20
+      type: write
+      sql: "INSERT INTO sbtest{table_id} (id, k, c, pad) VALUES (?, ?, ?, ?)"
+      parameters:
+        - name: table_id
+          distribution:
+            type: round_robin
+            range: [1, "${table_count}"]
+        - name: id
+          distribution:
+            type: uniform
+            range: [1, "${row_count}"]
+        - name: k
+          generator:
+            type: integer
+            range: [0, 100000]
+        - name: c
+          generator:
+            type: string
+            template: "{iteration:0>120}"
+        - name: pad
+          generator:
+            type: string
+            template: "{random:0>60}"

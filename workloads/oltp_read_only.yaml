@@ -1,0 +1,126 @@
+# OLTP Read-Only Workload
+#
+# Sysbench equivalent: oltp_read_only.lua
+# Read-only workload with point selects and range queries
+#
+# Default distribution (per transaction in sysbench):
+#   - 10 point selects
+#   - 1 simple range
+#   - 1 sum range
+#   - 1 order range
+#   - 1 distinct range
+#
+# For M0 (no transactions), we adjust to percentage weights
+
+workload:
+  name: oltp_read_only
+  description: "Read-only OLTP workload with various SELECT patterns"
+
+  # Schema (same as oltp_read_write)
+  schema:
+    tables:
+      - name: sbtest
+        count: 10
+        row_count: 10000
+        columns:
+          - name: id
+            type: INT
+            primary_key: true
+          - name: k
+            type: INT
+            default: 0
+            index: k_idx
+          - name: c
+            type: CHAR(120)
+            default: ""
+          - name: pad
+            type: CHAR(60)
+            default: ""
+
+  data_generation:
+    strategy: uniform
+
+  # Operations (all reads, weighted by frequency)
+  operations:
+    # Point select - 70% (most common)
+    - name: point_select
+      weight: 70
+      type: read
+      sql: "SELECT c FROM sbtest{table_id} WHERE id = ?"
+      parameters:
+        - name: table_id
+          distribution:
+            type: round_robin
+            range: [1, "${table_count}"]
+        - name: id
+          distribution:
+            type: uniform
+            range: [1, "${row_count}"]
+
+    # Simple range - 10%
+    - name: simple_range
+      weight: 10
+      type: read
+      sql: "SELECT c FROM sbtest{table_id} WHERE k BETWEEN ? AND ?"
+      parameters:
+        - name: table_id
+          distribution:
+            type: round_robin
+            range: [1, "${table_count}"]
+        - name: start_k
+          distribution:
+            type: uniform
+            range: [1, "${row_count}"]
+        - name: end_k
+          expression: "${start_k} + 100"  # Range size of 100
+
+    # Sum range - 10%
+    - name: sum_range
+      weight: 10
+      type: read
+      sql: "SELECT SUM(k) FROM sbtest{table_id} WHERE k BETWEEN ? AND ?"
+      parameters:
+        - name: table_id
+          distribution:
+            type: round_robin
+            range: [1, "${table_count}"]
+        - name: start_k
+          distribution:
+            type: uniform
+            range: [1, "${row_count}"]
+        - name: end_k
+          expression: "${start_k} + 100"
+
+    # Order range - 5%
+    - name: order_range
+      weight: 5
+      type: read
+      sql: "SELECT c FROM sbtest{table_id} WHERE k BETWEEN ? AND ? ORDER BY c"
+      parameters:
+        - name: table_id
+          distribution:
+            type: round_robin
+            range: [1, "${table_count}"]
+        - name: start_k
+          distribution:
+            type: uniform
+            range: [1, "${row_count}"]
+        - name: end_k
+          expression: "${start_k} + 100"
+
+    # Distinct range - 5%
+    - name: distinct_range
+      weight: 5
+      type: read
+      sql: "SELECT DISTINCT c FROM sbtest{table_id} WHERE k BETWEEN ? AND ? ORDER BY c"
+      parameters:
+        - name: table_id
+          distribution:
+            type: round_robin
+            range: [1, "${table_count}"]
+        - name: start_k
+          distribution:
+            type: uniform
+            range: [1, "${row_count}"]
+        - name: end_k
+          expression: "${start_k} + 100"

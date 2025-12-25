@@ -1,0 +1,87 @@
+# OLTP Read/Write Workload
+#
+# Sysbench equivalent: oltp_read_write.lua
+# Balanced workload with mix of reads and writes
+#
+# Default distribution:
+#   - 60% point selects
+#   - 40% updates (non-indexed column)
+#
+# Sysbench parameters supported:
+#   --tables          → schema.tables[].count
+#   --table-size      → schema.tables[].row_count
+#   --point-selects   → operations.point_select.count_per_tx
+#   --index-updates   → operations.update_index.count_per_tx
+#   --non-index-updates → operations.update_non_index.count_per_tx
+
+workload:
+  name: oltp_read_write
+  description: "Balanced read/write OLTP workload (sysbench compatible)"
+
+  # Schema definition (sysbench sbtest table)
+  schema:
+    tables:
+      - name: sbtest
+        count: 10                      # Creates sbtest1..sbtest10 (--tables)
+        row_count: 10000               # Rows per table (--table-size)
+        columns:
+          - name: id
+            type: INT
+            primary_key: true
+            auto_increment: false
+          - name: k
+            type: INT
+            default: 0
+            index: k_idx               # Secondary index
+          - name: c
+            type: CHAR(120)
+            default: ""
+          - name: pad
+            type: CHAR(60)
+            default: ""
+
+  # Data generation strategy
+  data_generation:
+    strategy: uniform                  # Uniform distribution for data
+    seed: null                         # Use scenario seed
+
+  # Operations (sysbench default: no explicit transactions for M0)
+  operations:
+    # Point select - 60% (default: 10 per transaction in sysbench)
+    - name: point_select
+      weight: 60
+      type: read
+      sql: "SELECT c FROM sbtest{table_id} WHERE id = ?"
+      parameters:
+        - name: table_id
+          distribution:
+            type: round_robin          # Cycle through tables
+            range: [1, "${table_count}"]
+        - name: id
+          distribution:
+            type: uniform              # Random row within table
+            range: [1, "${row_count}"]
+
+    # Update non-indexed column - 40% (default: 1 per transaction)
+    - name: update_non_index
+      weight: 40
+      type: write
+      sql: "UPDATE sbtest{table_id} SET c = ? WHERE id = ?"
+      parameters:
+        - name: table_id
+          distribution:
+            type: round_robin
+            range: [1, "${table_count}"]
+        - name: c
+          generator:
+            type: string
+            template: "{iteration:0>120}"  # Pad iteration to 120 chars
+        - name: id
+          distribution:
+            type: uniform
+            range: [1, "${row_count}"]
+
+  # Transaction settings (M0: disabled, future feature)
+  transactions:
+    enabled: false
+    isolation_level: REPEATABLE_READ

@@ -90,11 +90,45 @@ impl WorkloadFactory {
     /// Create workload from configuration
     pub fn create(config: &WorkloadConfig, seed: u64) -> Result<Box<dyn Workload>> {
         match config {
-            WorkloadConfig::Builtin { name, .. } => Self::create_builtin(name, config, seed),
+            // Declarative workload (primary method)
+            WorkloadConfig::Declarative { file, definition, overrides } => {
+                Self::create_declarative(file.as_ref(), definition.as_ref(), overrides.as_ref(), seed)
+            }
+
+            // Lua script
             WorkloadConfig::Lua { script } => Self::create_lua(script, seed),
+
+            // Deprecated builtin (warn and fall back to declarative)
+            #[allow(deprecated)]
+            WorkloadConfig::Builtin { name, .. } => {
+                eprintln!("Warning: Builtin workloads are deprecated. Use declarative workloads instead.");
+                eprintln!("         Migrate to: workloads/{}.yaml", name);
+                Self::create_builtin(name, config, seed)
+            }
         }
     }
 
+    fn create_declarative(
+        file: Option<&std::path::PathBuf>,
+        _definition: Option<&serde_yaml::Value>,
+        _overrides: Option<&serde_yaml::Value>,
+        _seed: u64,
+    ) -> Result<Box<dyn Workload>> {
+        // TODO: Implement DeclarativeWorkload
+        // For now, return error indicating not yet implemented
+        if let Some(f) = file {
+            Err(crate::Error::Workload(format!(
+                "Declarative workloads not yet implemented. Requested: {}",
+                f.display()
+            )))
+        } else {
+            Err(crate::Error::Workload(
+                "Declarative workloads not yet implemented (inline definition)".into()
+            ))
+        }
+    }
+
+    #[allow(deprecated)]
     fn create_builtin(
         name: &str,
         config: &WorkloadConfig,
