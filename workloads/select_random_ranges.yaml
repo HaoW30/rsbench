@@ -1,0 +1,51 @@
+# Select Random Ranges Workload
+#
+# Sysbench equivalent: select_random_ranges.lua
+# Select rows within random ranges
+
+workload:
+  name: select_random_ranges
+  description: "Select random ranges (100% reads)"
+
+  schema:
+    tables:
+      - name: sbtest
+        count: 10
+        row_count: 10000
+        columns:
+          - name: id
+            type: INT
+            primary_key: true
+          - name: k
+            type: INT
+            default: 0
+            index: k_idx
+          - name: c
+            type: CHAR(120)
+            default: ""
+          - name: pad
+            type: CHAR(60)
+            default: ""
+
+  data_generation:
+    strategy: uniform
+
+  operations:
+    # Select random range - 100%
+    - name: select_random_range
+      weight: 100
+      type: read
+      sql: "SELECT c FROM sbtest{table_id} WHERE id BETWEEN ? AND ?"
+      parameters:
+        - name: table_id
+          distribution:
+            type: round_robin
+            range: [1, "${table_count}"]
+        - name: start_id
+          distribution:
+            type: uniform
+            range: [1, "${row_count}"]
+        - name: end_id
+          distribution:
+            type: uniform
+            range: [1, "${row_count}"]

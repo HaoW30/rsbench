@@ -1,0 +1,83 @@
+# Select Random Points Workload
+#
+# Sysbench equivalent: select_random_points.lua
+# Select 10 random points per query
+
+workload:
+  name: select_random_points
+  description: "Select 10 random points per query (100% reads)"
+
+  schema:
+    tables:
+      - name: sbtest
+        count: 10
+        row_count: 10000
+        columns:
+          - name: id
+            type: INT
+            primary_key: true
+          - name: k
+            type: INT
+            default: 0
+            index: k_idx
+          - name: c
+            type: CHAR(120)
+            default: ""
+          - name: pad
+            type: CHAR(60)
+            default: ""
+
+  data_generation:
+    strategy: uniform
+
+  operations:
+    # Select random points - 100%
+    - name: select_random_points
+      weight: 100
+      type: read
+      sql: "SELECT id, k, c, pad FROM sbtest{table_id} WHERE id IN (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)"
+      parameters:
+        - name: table_id
+          distribution:
+            type: round_robin
+            range: [1, "${table_count}"]
+        - name: id1
+          distribution:
+            type: uniform
+            range: [1, "${row_count}"]
+        - name: id2
+          distribution:
+            type: uniform
+            range: [1, "${row_count}"]
+        - name: id3
+          distribution:
+            type: uniform
+            range: [1, "${row_count}"]
+        - name: id4
+          distribution:
+            type: uniform
+            range: [1, "${row_count}"]
+        - name: id5
+          distribution:
+            type: uniform
+            range: [1, "${row_count}"]
+        - name: id6
+          distribution:
+            type: uniform
+            range: [1, "${row_count}"]
+        - name: id7
+          distribution:
+            type: uniform
+            range: [1, "${row_count}"]
+        - name: id8
+          distribution:
+            type: uniform
+            range: [1, "${row_count}"]
+        - name: id9
+          distribution:
+            type: uniform
+            range: [1, "${row_count}"]
+        - name: id10
+          distribution:
+            type: uniform
+            range: [1, "${row_count}"]

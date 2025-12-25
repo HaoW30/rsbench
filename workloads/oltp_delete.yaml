@@ -1,0 +1,69 @@
+# OLTP Delete Workload
+#
+# Sysbench equivalent: oltp_delete.lua
+# Delete workload followed by insert to maintain table size
+
+workload:
+  name: oltp_delete
+  description: "Delete and re-insert workload (100% writes)"
+
+  schema:
+    tables:
+      - name: sbtest
+        count: 10
+        row_count: 10000
+        columns:
+          - name: id
+            type: INT
+            primary_key: true
+            auto_increment: true
+          - name: k
+            type: INT
+            default: 0
+            index: k_idx
+          - name: c
+            type: CHAR(120)
+            default: ""
+          - name: pad
+            type: CHAR(60)
+            default: ""
+
+  data_generation:
+    strategy: uniform
+
+  operations:
+    # Delete and insert transaction - 100%
+    - name: delete_insert
+      weight: 100
+      type: write
+      transaction_operations:
+        - name: delete
+          sql: "DELETE FROM sbtest{table_id} WHERE id = ?"
+          parameters:
+            - name: table_id
+              distribution:
+                type: round_robin
+                range: [1, "${table_count}"]
+            - name: id
+              distribution:
+                type: uniform
+                range: [1, "${row_count}"]
+        - name: insert
+          sql: "INSERT INTO sbtest{table_id} (k, c, pad) VALUES (?, ?, ?)"
+          parameters:
+            - name: table_id
+              distribution:
+                type: round_robin
+                range: [1, "${table_count}"]
+            - name: k
+              distribution:
+                type: uniform
+                range: [0, 100000]
+            - name: c
+              generator:
+                type: string
+                template: "{iteration:0>120}"
+            - name: pad
+              generator:
+                type: string
+                template: "{iteration:0>60}"

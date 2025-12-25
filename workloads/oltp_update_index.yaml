@@ -1,0 +1,47 @@
+# OLTP Update Index Workload
+#
+# Sysbench equivalent: oltp_update_index.lua
+# Update indexed column workload (100% writes on indexed column)
+
+workload:
+  name: oltp_update_index
+  description: "Update indexed column only (100% writes)"
+
+  schema:
+    tables:
+      - name: sbtest
+        count: 10
+        row_count: 10000
+        columns:
+          - name: id
+            type: INT
+            primary_key: true
+          - name: k
+            type: INT
+            default: 0
+            index: k_idx
+          - name: c
+            type: CHAR(120)
+            default: ""
+          - name: pad
+            type: CHAR(60)
+            default: ""
+
+  data_generation:
+    strategy: uniform
+
+  operations:
+    # Update indexed column - 100%
+    - name: update_index
+      weight: 100
+      type: write
+      sql: "UPDATE sbtest{table_id} SET k = k + 1 WHERE id = ?"
+      parameters:
+        - name: table_id
+          distribution:
+            type: round_robin
+            range: [1, "${table_count}"]
+        - name: id
+          distribution:
+            type: uniform
+            range: [1, "${row_count}"]
