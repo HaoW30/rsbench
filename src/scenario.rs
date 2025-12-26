@@ -64,7 +64,10 @@ impl ScenarioExecutor {
     ) -> Self {
         let rate_limiter = match &config.executor {
             ExecutorConfig::ConstantRate { rate, .. } => RateLimiter::new(*rate),
-            ExecutorConfig::RampingRate { stages, .. } => RateLimiter::new(stages[0].target_rate),
+            ExecutorConfig::RampingRate { stages, .. } => {
+                let initial_rate = stages.first().map(|s| s.target_rate).unwrap_or(100);
+                RateLimiter::new(initial_rate)
+            }
             // ClosedLoop doesn't use rate limiting (workers drive the rate)
             ExecutorConfig::ClosedLoop { .. } => RateLimiter::new(u64::MAX),
         };
@@ -86,6 +89,41 @@ impl ScenarioExecutor {
         self.event_rx = Some(rx);
     }
 
+    /// Handle incoming events (non-blocking)
+    /// Returns true if should continue execution, false if should stop
+    async fn handle_events(&mut self) -> Result<()> {
+        if let Some(ref mut rx) = self.event_rx {
+            // Try to receive events without blocking
+            while let Ok(event) = rx.try_recv() {
+                match event {
+                    Event::RateChange(new_rate) => {
+                        self.rate_limiter.set_rate(new_rate);
+                    }
+                    Event::PhaseTransition(phase) => match phase {
+                        Phase::Pause => {
+                            self.paused = true;
+                        }
+                        Phase::Resume => {
+                            self.paused = false;
+                        }
+                        Phase::Shutdown => {
+                            self.shutdown_requested = true;
+                        }
+                    },
+                    Event::MetricsSnapshot => {
+                        // TODO: M1 - Take intermediate snapshot
+                        // For now, this is a no-op
+                    }
+                    Event::Custom(_) => {
+                        // TODO: M1 - Handle custom events
+                        // For now, this is a no-op
+                    }
+                }
+            }
+        }
+        Ok(())
+    }
+
     /// Execute scenario
     pub async fn execute(&mut self) -> Result<ScenarioResult> {
         // TODO: Prepare workload
@@ -105,12 +143,29 @@ impl ScenarioExecutor {
         }
     }
 
-    async fn execute_constant_rate(&mut self, _rate: u64, duration: Duration) -> Result<ScenarioResult> {
+    async fn execute_constant_rate(&mut self, rate: u64, duration: Duration) -> Result<ScenarioResult> {
         let start = Instant::now();
         let end_time = start + duration;
         let mut iteration = 0u64;
 
+        // Set initial rate
+        self.rate_limiter.set_rate(rate);
+
         while Instant::now() < end_time {
+            // Check for events (pause, resume, shutdown, rate change)
+            self.handle_events().await?;
+
+            // Handle shutdown request
+            if self.shutdown_requested {
+                break;
+            }
+
+            // Handle pause state
+            if self.paused {
+                tokio::time::sleep(Duration::from_millis(100)).await;
+                continue;
+            }
+
             // Rate limiting (time-driven)
             self.rate_limiter.acquire().await?;
 
@@ -123,28 +178,29 @@ impl ScenarioExecutor {
 
             let op = self.workload.next_operation(&ctx)?;
 
-            // Submit to runtime (non-blocking)
+            // Submit to runtime (fire-and-forget)
             let runtime = self.runtime.clone();
             tokio::spawn(async move {
                 let _ = runtime.submit(op).await;
+                // Errors are recorded in metrics collector
             });
 
             iteration += 1;
         }
 
-        // Wait a bit for in-flight operations to complete
-        tokio::time::sleep(Duration::from_secs(1)).await;
+        // Wait for in-flight operations to complete
+        tokio::time::sleep(Duration::from_millis(100)).await;
 
         // Collect results
-        let end_time = Instant::now();
+        let actual_end = Instant::now();
         let metrics_snapshot = self.metrics.snapshot();
         Ok(ScenarioResult {
             duration: start.elapsed(),
             operations_completed: iteration,
-            operations_failed: 0, // M0: simplified
+            operations_failed: 0, // M0: simplified, actual errors in metrics
             metrics: metrics_snapshot.clone(),
             start_time: start,
-            end_time,
+            end_time: actual_end,
             backpressure_events: metrics_snapshot.backpressure_events,
         })
     }
@@ -152,45 +208,98 @@ impl ScenarioExecutor {
     async fn execute_ramping_rate(&mut self, stages: &[RateStage]) -> Result<ScenarioResult> {
         let start = Instant::now();
         let mut iteration = 0u64;
+        let mut current_stage_index = 0;
+        let mut last_stage_rate = 0u64;
 
-        for stage in stages {
-            self.rate_limiter.set_rate(stage.target_rate);
-            let stage_end = Instant::now() + stage.duration;
+        loop {
+            // Check for events (pause, resume, shutdown, rate change)
+            self.handle_events().await?;
 
-            while Instant::now() < stage_end {
-                self.rate_limiter.acquire().await?;
-
-                let ctx = ExecutionContext {
-                    worker_id: 0,
-                    iteration,
-                    elapsed: start.elapsed(),
-                };
-
-                let op = self.workload.next_operation(&ctx)?;
-
-                let runtime = self.runtime.clone();
-                tokio::spawn(async move {
-                    let _ = runtime.submit(op).await;
-                });
-
-                iteration += 1;
+            // Handle shutdown request
+            if self.shutdown_requested {
+                break;
             }
+
+            // Handle pause state
+            if self.paused {
+                tokio::time::sleep(Duration::from_millis(100)).await;
+                continue;
+            }
+
+            // Determine current stage based on elapsed time
+            let elapsed = start.elapsed();
+            let current_stage = self.get_current_stage(stages, elapsed, &mut current_stage_index);
+
+            // If all stages complete, break
+            if current_stage.is_none() {
+                break;
+            }
+
+            let stage = current_stage.unwrap();
+
+            // Update rate limiter if stage changed
+            if stage.target_rate != last_stage_rate {
+                self.rate_limiter.set_rate(stage.target_rate);
+                last_stage_rate = stage.target_rate;
+            }
+
+            // Rate limiting (time-driven)
+            self.rate_limiter.acquire().await?;
+
+            // Generate operation
+            let ctx = ExecutionContext {
+                worker_id: 0,
+                iteration,
+                elapsed,
+            };
+
+            let op = self.workload.next_operation(&ctx)?;
+
+            // Submit to runtime (fire-and-forget)
+            let runtime = self.runtime.clone();
+            tokio::spawn(async move {
+                let _ = runtime.submit(op).await;
+                // Errors are recorded in metrics collector
+            });
+
+            iteration += 1;
         }
 
-        // Wait for in-flight operations
-        tokio::time::sleep(Duration::from_secs(1)).await;
+        // Wait for in-flight operations to complete
+        tokio::time::sleep(Duration::from_millis(100)).await;
 
-        let end_time = Instant::now();
+        // Collect results
+        let actual_end = Instant::now();
         let metrics_snapshot = self.metrics.snapshot();
         Ok(ScenarioResult {
             duration: start.elapsed(),
             operations_completed: iteration,
-            operations_failed: 0,
+            operations_failed: 0, // M0: simplified, actual errors in metrics
             metrics: metrics_snapshot.clone(),
             start_time: start,
-            end_time,
+            end_time: actual_end,
             backpressure_events: metrics_snapshot.backpressure_events,
         })
+    }
+
+    /// Get the current stage based on elapsed time
+    fn get_current_stage<'a>(
+        &self,
+        stages: &'a [RateStage],
+        elapsed: Duration,
+        current_index: &mut usize,
+    ) -> Option<&'a RateStage> {
+        let mut cumulative_duration = Duration::from_secs(0);
+
+        for (index, stage) in stages.iter().enumerate() {
+            cumulative_duration += stage.duration;
+            if elapsed < cumulative_duration {
+                *current_index = index;
+                return Some(stage);
+            }
+        }
+
+        None // All stages complete
     }
 
     async fn execute_closed_loop(&mut self, _workers: usize, _duration: Duration) -> Result<ScenarioResult> {
@@ -434,5 +543,260 @@ mod tests {
         assert!(!result.had_backpressure());
         assert_eq!(result.backpressure_percentage(), 0.0);
         assert_eq!(result.success_rate(), 1.0);
+    }
+
+    // Mock workload for testing
+    struct MockWorkload;
+
+    impl crate::workload::Workload for MockWorkload {
+        fn prepare(&mut self, _ctx: &mut crate::workload::PrepareContext) -> Result<()> {
+            Ok(())
+        }
+
+        fn next_operation(&mut self, _ctx: &crate::workload::ExecutionContext) -> Result<crate::workload::Operation> {
+            Ok(crate::workload::Operation {
+                name: "test".to_string(),
+                sql: "SELECT 1".to_string(),
+                params: vec![],
+                operation_type: crate::workload::OperationType::Read,
+                is_transaction: false,
+                transaction_sqls: vec![],
+                transaction_params: vec![],
+            })
+        }
+
+        fn cleanup(&mut self) -> Result<()> {
+            Ok(())
+        }
+
+        fn name(&self) -> &str {
+            "mock"
+        }
+    }
+
+    // Mock runtime for testing
+    struct MockRuntime;
+
+    #[async_trait::async_trait]
+    impl crate::runtime::RuntimeEngine for MockRuntime {
+        async fn submit(&self, _op: crate::workload::Operation) -> Result<crate::runtime::OperationResult> {
+            Ok(crate::runtime::OperationResult {
+                success: true,
+                duration: Duration::from_millis(10),
+                rows_affected: 1,
+                error: None,
+            })
+        }
+
+        fn stats(&self) -> crate::runtime::RuntimeStats {
+            crate::runtime::RuntimeStats {
+                active_connections: 0,
+                queued_operations: 0,
+                pool_utilization: 0.0,
+                backpressure_active: false,
+            }
+        }
+
+        async fn shutdown(&mut self) -> Result<()> {
+            Ok(())
+        }
+    }
+
+    #[test]
+    fn test_get_current_stage() {
+        use crate::config::RateStage;
+        use crate::metrics::MetricsCollector;
+
+        // Create a minimal executor for testing
+        let scenario_config = ScenarioConfig {
+            executor: ExecutorConfig::RampingRate {
+                stages: vec![],
+                prealloc_connections: 50,
+                max_connections: 10,
+            },
+            workload: crate::config::WorkloadConfig::Declarative {
+                file: None,
+                definition: None,
+                overrides: None,
+            },
+        };
+
+        let workload = Box::new(MockWorkload);
+        let runtime = Arc::new(MockRuntime);
+        let metrics = MetricsCollector::new();
+
+        let executor = ScenarioExecutor::new(scenario_config, workload, runtime, metrics);
+
+        // Test stages
+        let stages = vec![
+            RateStage {
+                target_rate: 100,
+                duration: Duration::from_secs(10),
+            },
+            RateStage {
+                target_rate: 200,
+                duration: Duration::from_secs(10),
+            },
+            RateStage {
+                target_rate: 300,
+                duration: Duration::from_secs(10),
+            },
+        ];
+
+        let mut current_index = 0;
+
+        // Test stage 0 (0-10 seconds)
+        let stage = executor.get_current_stage(&stages, Duration::from_secs(5), &mut current_index);
+        assert!(stage.is_some());
+        assert_eq!(stage.unwrap().target_rate, 100);
+        assert_eq!(current_index, 0);
+
+        // Test stage 1 (10-20 seconds)
+        let stage = executor.get_current_stage(&stages, Duration::from_secs(15), &mut current_index);
+        assert!(stage.is_some());
+        assert_eq!(stage.unwrap().target_rate, 200);
+        assert_eq!(current_index, 1);
+
+        // Test stage 2 (20-30 seconds)
+        let stage = executor.get_current_stage(&stages, Duration::from_secs(25), &mut current_index);
+        assert!(stage.is_some());
+        assert_eq!(stage.unwrap().target_rate, 300);
+        assert_eq!(current_index, 2);
+
+        // Test after all stages (30+ seconds)
+        let stage = executor.get_current_stage(&stages, Duration::from_secs(35), &mut current_index);
+        assert!(stage.is_none());
+    }
+
+    #[test]
+    fn test_get_current_stage_edge_cases() {
+        use crate::config::RateStage;
+        use crate::metrics::MetricsCollector;
+
+        let scenario_config = ScenarioConfig {
+            executor: ExecutorConfig::RampingRate {
+                stages: vec![],
+                prealloc_connections: 50,
+                max_connections: 10,
+            },
+            workload: crate::config::WorkloadConfig::Declarative {
+                file: None,
+                definition: None,
+                overrides: None,
+            },
+        };
+
+        let workload = Box::new(MockWorkload);
+        let runtime = Arc::new(MockRuntime);
+        let metrics = MetricsCollector::new();
+
+        let executor = ScenarioExecutor::new(scenario_config, workload, runtime, metrics);
+
+        // Empty stages
+        let stages: Vec<RateStage> = vec![];
+        let mut current_index = 0;
+        let stage = executor.get_current_stage(&stages, Duration::from_secs(0), &mut current_index);
+        assert!(stage.is_none());
+
+        // Single stage at exact boundary
+        let stages = vec![RateStage {
+            target_rate: 100,
+            duration: Duration::from_secs(10),
+        }];
+        let stage = executor.get_current_stage(&stages, Duration::from_secs(10), &mut current_index);
+        assert!(stage.is_none()); // Exactly at boundary = complete
+
+        // At time zero
+        let stage = executor.get_current_stage(&stages, Duration::from_secs(0), &mut current_index);
+        assert!(stage.is_some());
+        assert_eq!(stage.unwrap().target_rate, 100);
+    }
+
+    #[tokio::test]
+    async fn test_handle_events_pause_resume() {
+        use crate::metrics::MetricsCollector;
+
+        let scenario_config = ScenarioConfig {
+            executor: ExecutorConfig::ConstantRate {
+                rate: 100,
+                duration: Duration::from_secs(10),
+                max_connections: 10,
+            },
+            workload: crate::config::WorkloadConfig::Declarative {
+                file: None,
+                definition: None,
+                overrides: None,
+            },
+        };
+
+        let workload = Box::new(MockWorkload);
+        let runtime = Arc::new(MockRuntime);
+        let metrics = MetricsCollector::new();
+
+        let mut executor = ScenarioExecutor::new(scenario_config, workload, runtime, metrics);
+
+        // Create event channel
+        let (tx, rx) = mpsc::channel(10);
+        executor.attach_event_stream(rx);
+
+        // Initially not paused
+        assert!(!executor.paused);
+        assert!(!executor.shutdown_requested);
+
+        // Send pause event
+        tx.send(Event::PhaseTransition(Phase::Pause))
+            .await
+            .unwrap();
+        executor.handle_events().await.unwrap();
+        assert!(executor.paused);
+
+        // Send resume event
+        tx.send(Event::PhaseTransition(Phase::Resume))
+            .await
+            .unwrap();
+        executor.handle_events().await.unwrap();
+        assert!(!executor.paused);
+
+        // Send shutdown event
+        tx.send(Event::PhaseTransition(Phase::Shutdown))
+            .await
+            .unwrap();
+        executor.handle_events().await.unwrap();
+        assert!(executor.shutdown_requested);
+    }
+
+    #[tokio::test]
+    async fn test_handle_events_rate_change() {
+        use crate::metrics::MetricsCollector;
+
+        let scenario_config = ScenarioConfig {
+            executor: ExecutorConfig::ConstantRate {
+                rate: 100,
+                duration: Duration::from_secs(10),
+                max_connections: 10,
+            },
+            workload: crate::config::WorkloadConfig::Declarative {
+                file: None,
+                definition: None,
+                overrides: None,
+            },
+        };
+
+        let workload = Box::new(MockWorkload);
+        let runtime = Arc::new(MockRuntime);
+        let metrics = MetricsCollector::new();
+
+        let mut executor = ScenarioExecutor::new(scenario_config, workload, runtime, metrics);
+
+        // Create event channel
+        let (tx, rx) = mpsc::channel(10);
+        executor.attach_event_stream(rx);
+
+        // Send rate change event
+        tx.send(Event::RateChange(500)).await.unwrap();
+        executor.handle_events().await.unwrap();
+
+        // Note: We can't easily verify the rate limiter state without exposing it,
+        // but we can at least verify the event was processed without errors
     }
 }
