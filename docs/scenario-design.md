@@ -755,6 +755,156 @@ scenario:
 
 **Recommendation**: Use AsyncRuntime for all new workloads. BlockingRuntime may be removed in M2 once closed-loop executor is implemented.
 
+#### 5.3.2 Backpressure Awareness Deep Dive
+
+**What is Backpressure?**
+
+Backpressure occurs when the **client (RSBench) is saturated**, not the database. This is a critical distinction:
+
+- ✅ **Backpressure**: RSBench can't submit operations fast enough (pool exhausted, semaphore full)
+- ❌ **NOT Backpressure**: Database is slow (high query latency)
+
+**Why Backpressure Matters:**
+
+Traditional tools like sysbench **hide backpressure** by blocking threads:
+```
+Thread blocked → Can't measure latency → Results are invalid
+```
+
+RSBench **makes backpressure visible**:
+```
+Pool saturated → Backpressure event recorded → User knows results are invalid
+```
+
+**How Backpressure is Detected:**
+
+RSBench monitors two saturation points:
+
+1. **Connection Pool Utilization**:
+   ```rust
+   let pool_stats = self.pool.stats();
+   let utilization = pool_stats.active_connections as f64 / pool_stats.max_connections as f64;
+
+   if utilization > BACKPRESSURE_THRESHOLD {  // Default: 0.8
+       metrics.record_backpressure_event();
+   }
+   ```
+
+2. **Runtime Semaphore Saturation**:
+   ```rust
+   // In AsyncRuntime::submit()
+   if self.semaphore.available_permits() == 0 {
+       metrics.record_backpressure_event();
+   }
+   ```
+
+**Backpressure Metrics:**
+
+RSBench tracks backpressure as first-class metrics:
+
+| Metric | Type | Description |
+|--------|------|-------------|
+| `backpressure_events` | Counter | Total number of backpressure events detected |
+| `backpressure_rate` | Gauge | Events per second |
+| `backpressure_percentage` | Percentage | (backpressure_events / total_operations) × 100 |
+| `pool_utilization_p99` | Percentile | 99th percentile pool utilization |
+
+**Example Metrics Output:**
+
+```
+Test Results:
+  Operations: 60000 total
+  Success: 58000 (96.7%)
+  Errors: 2000 (3.3%)
+
+  Client Metrics:
+    Backpressure Events: 5420    ⚠️ HIGH - Results may be invalid!
+    Backpressure Rate: 90.3/sec
+    Backpressure %: 9.0%
+    Pool Utilization p99: 98.2%  ⚠️ Client saturated
+
+  Latency Metrics:
+    p50: 5ms      ⚠️ Don't trust these when backpressure > 1%
+    p99: 120ms
+    p999: 450ms
+```
+
+**Interpreting Backpressure:**
+
+| Backpressure % | Interpretation | Action |
+|----------------|----------------|--------|
+| 0% - 1% | ✅ No backpressure | Results are valid, database performance is being measured |
+| 1% - 5% | ⚠️ Minor backpressure | Results may be slightly skewed, consider increasing max_connections |
+| 5% - 20% | ❌ Moderate backpressure | Results are invalid, you're measuring client limits, not database |
+| > 20% | ❌ Severe backpressure | Test is completely invalid, significantly increase max_connections |
+
+**Configuration:**
+
+```yaml
+runtime:
+  type: async
+  max_connections: 100          # Increase if backpressure detected
+  backpressure_threshold: 0.8   # Alert when pool is 80% utilized
+
+scenario:
+  executor:
+    type: constant-rate
+    rate: 1000                  # Reduce if backpressure occurs
+    duration: 60s
+```
+
+**Best Practices:**
+
+1. **Always check backpressure metrics** after tests
+2. **Increase max_connections** if backpressure > 1%
+3. **Don't trust latency percentiles** when backpressure is high
+4. **Use backpressure as a signal** to tune client capacity
+5. **Distinguish client limits from database limits** - this is RSBench's superpower
+
+**Comparison with Sysbench:**
+
+| Aspect | Sysbench | RSBench |
+|--------|----------|---------|
+| Backpressure visibility | ❌ Hidden (threads block) | ✅ Explicit metric |
+| Client saturation detection | ❌ No detection | ✅ Automatic detection |
+| Invalid result warning | ❌ No warning | ✅ Clear indication when backpressure > threshold |
+| Tuning guidance | ❌ Trial and error | ✅ Backpressure % guides max_connections tuning |
+
+**Example: Detecting and Fixing Backpressure**
+
+```bash
+# Run 1: Initial test
+rsbench --scenario scenarios/load_test.yaml
+
+# Output shows:
+#   Backpressure Events: 8200 (13.7%)
+#   Pool Utilization p99: 99.8%
+# ⚠️ Results are INVALID - measuring client, not database
+
+# Run 2: Increase connections
+# Edit config.yaml: max_connections: 100 → 500
+
+rsbench --scenario scenarios/load_test.yaml
+
+# Output shows:
+#   Backpressure Events: 12 (0.02%)
+#   Pool Utilization p99: 45.2%
+# ✅ Results are VALID - now measuring database performance
+```
+
+**Advanced: Backpressure Event Correlation**
+
+In M1+, backpressure events will be timestamped for correlation with external events:
+
+```
+Timeline:
+  0s - 30s:  Backpressure: 0%     (normal)
+  30s - 32s: Backpressure: 45%    (spike during failover)
+  32s - 60s: Backpressure: 0%     (recovered)
+```
+
+This allows identifying whether latency spikes are database issues or client saturation.
+
 ### 5.4 Metrics Module
 
 **Interface**: `MetricsCollector`
@@ -799,6 +949,542 @@ pub enum ExecutorConfig {
 - Receive config in constructor
 - Dispatch to appropriate executor method based on type
 - Extract rate, duration, stages as needed
+
+### 5.6 Event Module Integration
+
+**Purpose**: The Event Module is a **parallel module** that enables external event-driven test orchestration, allowing RSBench to respond to real-world events during test execution.
+
+**Module Position in Architecture**:
+
+```
+┌─────────────────────────────────────────────────────────────────┐
+│                     RSBench Architecture                         │
+│                                                                  │
+│  ┌──────────────┐        ┌──────────────┐                      │
+│  │   Scenario   │        │    Event     │  ← PARALLEL MODULES  │
+│  │   Module     │◄───────│   Module     │                      │
+│  └──────┬───────┘  mpsc  └──────┬───────┘                      │
+│         │         channel        │                              │
+│         │                        │                              │
+│         │                        ├─► K8s Watcher               │
+│         │                        ├─► Webhook Listener          │
+│         │                        └─► Timer Events              │
+│         │                                                       │
+│         ├──► Runtime ──► Pool ──► Driver ──► Database          │
+│         ├──► Workload                                          │
+│         └──► Metrics                                           │
+│                                                                  │
+│  Event Module feeds events to Scenario via async channel       │
+│  Scenario reacts to events (phase changes, rate adjustments)   │
+└─────────────────────────────────────────────────────────────────┘
+```
+
+**Key Design Principle**: Event Module is **independent and parallel** - it runs alongside the Scenario Module, not inside it.
+
+---
+
+#### 5.6.1 Integration Model
+
+**Communication Channel**: Event Module → Scenario Module via `tokio::mpsc` channel
+
+```rust
+// Event Module produces events
+pub struct EventModule {
+    event_tx: mpsc::Sender<Event>,  // Send events to scenario
+    watchers: Vec<Box<dyn EventWatcher>>,
+}
+
+// Scenario Module consumes events
+pub struct ScenarioExecutor {
+    event_rx: Option<mpsc::Receiver<Event>>,  // Receive events from event module
+    // ... other fields
+}
+```
+
+**Integration Pattern**:
+
+```rust
+// In main.rs or orchestration layer
+async fn run_scenario_with_events(config: Config) -> Result<ScenarioResult> {
+    // 1. Create event channel
+    let (event_tx, event_rx) = mpsc::channel(100);
+
+    // 2. Start Event Module (parallel task)
+    let event_module = EventModule::new(config.events, event_tx);
+    let event_handle = tokio::spawn(async move {
+        event_module.run().await
+    });
+
+    // 3. Create Scenario with event receiver
+    let mut scenario = ScenarioExecutor::new(
+        config.scenario,
+        workload,
+        runtime,
+        metrics,
+    );
+    scenario.attach_event_stream(event_rx);  // Attach event channel
+
+    // 4. Run scenario (will react to events)
+    let result = scenario.execute().await?;
+
+    // 5. Shutdown event module
+    event_handle.abort();
+
+    Ok(result)
+}
+```
+
+**Why Parallel, Not Nested**:
+- ✅ **Separation of Concerns**: Event watching is independent from workload execution
+- ✅ **Reusability**: Same Event Module works with any Scenario executor
+- ✅ **Composability**: Can run Scenario without Event Module (standalone mode)
+- ✅ **Testability**: Can test Event Module and Scenario Module independently
+- ❌ **Not Nested**: Event Module is not a component inside Scenario Module
+
+---
+
+#### 5.6.2 How Scenario Reacts to Events
+
+**Event-Driven Execution Loop**:
+
+```rust
+impl ScenarioExecutor {
+    pub async fn execute(&mut self) -> Result<ScenarioResult> {
+        let start = Instant::now();
+        let mut iteration = 0;
+
+        loop {
+            // Check for external events (non-blocking)
+            if let Some(event_rx) = &mut self.event_rx {
+                if let Ok(event) = event_rx.try_recv() {
+                    self.handle_event(event).await?;  // React to event
+                }
+            }
+
+            // Normal execution flow
+            if start.elapsed() >= self.duration {
+                break;
+            }
+
+            self.rate_limiter.acquire().await?;
+            let ctx = ExecutionContext { iteration, elapsed: start.elapsed(), worker_id: 0 };
+            let op = self.workload.next_operation(&ctx)?;
+
+            tokio::spawn(async move {
+                let _ = runtime.submit(op).await;
+            });
+
+            iteration += 1;
+        }
+
+        Ok(self.create_result(start.elapsed()))
+    }
+
+    async fn handle_event(&mut self, event: Event) -> Result<()> {
+        match event {
+            Event::RateChange(new_rate) => {
+                // Dynamically adjust rate limiter
+                self.rate_limiter.set_rate(new_rate);
+                tracing::info!("Rate changed to {} ops/sec due to event", new_rate);
+            }
+            Event::PhaseTransition(phase) => {
+                // Change execution phase
+                match phase {
+                    Phase::Pause => self.paused = true,
+                    Phase::Resume => self.paused = false,
+                    Phase::Shutdown => return Err(Error::GracefulShutdown),
+                }
+            }
+            Event::MetricsSnapshot => {
+                // Take intermediate snapshot
+                let snapshot = self.metrics.snapshot();
+                // Optionally export or log
+            }
+            Event::Custom(data) => {
+                // User-defined event handling
+                self.handle_custom_event(data)?;
+            }
+        }
+        Ok(())
+    }
+}
+```
+
+**Event Types**:
+
+```rust
+pub enum Event {
+    // Rate control events
+    RateChange(u64),                    // Change ops/sec dynamically
+
+    // Phase control events
+    PhaseTransition(Phase),             // Pause, Resume, Shutdown
+
+    // Metrics events
+    MetricsSnapshot,                    // Take intermediate snapshot
+
+    // Routing events (distributed mode)
+    RoutingChange(RoutingStrategy),     // Change endpoint routing
+
+    // Custom events
+    Custom(serde_json::Value),          // User-defined events
+
+    // Infrastructure events (M1+)
+    K8sEvent {
+        namespace: String,
+        resource: String,
+        event_type: String,              // pod.delete, deployment.update, etc.
+        timestamp: Instant,
+    },
+}
+
+pub enum Phase {
+    Pause,      // Stop submitting operations
+    Resume,     // Continue submitting operations
+    Shutdown,   // Graceful shutdown
+}
+```
+
+---
+
+#### 5.6.3 Event Sources
+
+**1. K8s Event Watcher** (M1+):
+
+```rust
+pub struct K8sEventWatcher {
+    client: kube::Client,
+    config: K8sWatchConfig,
+    event_tx: mpsc::Sender<Event>,
+}
+
+impl K8sEventWatcher {
+    pub async fn watch(&self) -> Result<()> {
+        let pods: Api<Pod> = Api::namespaced(self.client.clone(), &self.config.namespace);
+
+        let mut watcher = watcher(pods, Default::default()).boxed();
+
+        while let Some(event) = watcher.next().await {
+            match event? {
+                WatchEvent::Deleted(pod) => {
+                    // Pod deleted - potential failover
+                    self.event_tx.send(Event::K8sEvent {
+                        namespace: self.config.namespace.clone(),
+                        resource: format!("pod/{}", pod.metadata.name.unwrap()),
+                        event_type: "delete".to_string(),
+                        timestamp: Instant::now(),
+                    }).await?;
+                }
+                WatchEvent::Modified(pod) => {
+                    // Pod updated - potential rolling upgrade
+                    // ... send event
+                }
+                _ => {}
+            }
+        }
+
+        Ok(())
+    }
+}
+```
+
+**Configuration**:
+
+```yaml
+scenario:
+  executor:
+    type: constant-rate
+    rate: 1000
+    duration: 600s
+
+  events:
+    - source: k8s
+      namespace: tidb-cluster
+      resources:
+        - pods
+        - deployments
+      watch_events:
+        - delete      # Failover
+        - update      # Rolling upgrade
+      actions:
+        - event_type: pod.delete
+          action:
+            type: observe      # Don't change rate, just record timestamp
+        - event_type: deployment.update
+          action:
+            type: rate_change
+            rate: 500          # Reduce load during upgrade
+```
+
+**2. Webhook Listener** (M1+):
+
+```rust
+pub struct WebhookEventListener {
+    port: u16,
+    event_tx: mpsc::Sender<Event>,
+}
+
+impl WebhookEventListener {
+    pub async fn listen(&self) -> Result<()> {
+        let app = Router::new()
+            .route("/events", post(handle_webhook))
+            .with_state(self.event_tx.clone());
+
+        axum::Server::bind(&format!("0.0.0.0:{}", self.port).parse()?)
+            .serve(app.into_make_service())
+            .await?;
+
+        Ok(())
+    }
+}
+
+async fn handle_webhook(
+    State(tx): State<mpsc::Sender<Event>>,
+    Json(payload): Json<WebhookPayload>,
+) -> StatusCode {
+    let event = Event::Custom(payload.data);
+    tx.send(event).await.ok();
+    StatusCode::OK
+}
+```
+
+**Configuration**:
+
+```yaml
+scenario:
+  events:
+    - source: webhook
+      port: 8090
+      path: /events
+      actions:
+        - filter: '$.event_type == "chaos_experiment"'
+          action:
+            type: rate_change
+            rate: 2000   # Increase load during chaos experiment
+```
+
+**3. Timer Events** (M0):
+
+```rust
+pub struct TimerEventSource {
+    schedule: Vec<ScheduledEvent>,
+    event_tx: mpsc::Sender<Event>,
+}
+
+#[derive(Debug)]
+pub struct ScheduledEvent {
+    pub trigger_at: Duration,   // Offset from test start
+    pub event: Event,
+}
+
+impl TimerEventSource {
+    pub async fn run(&self, start_time: Instant) -> Result<()> {
+        for scheduled in &self.schedule {
+            let sleep_duration = scheduled.trigger_at.saturating_sub(start_time.elapsed());
+            tokio::time::sleep(sleep_duration).await;
+            self.event_tx.send(scheduled.event.clone()).await?;
+        }
+        Ok(())
+    }
+}
+```
+
+**Configuration**:
+
+```yaml
+scenario:
+  executor:
+    type: constant-rate
+    rate: 1000
+    duration: 600s
+
+  events:
+    - source: timer
+      schedule:
+        - at: 120s
+          action:
+            type: rate_change
+            rate: 2000       # Ramp up at 2 minutes
+
+        - at: 480s
+          action:
+            type: rate_change
+            rate: 500        # Ramp down at 8 minutes
+```
+
+---
+
+#### 5.6.4 Use Cases
+
+**Use Case 1: Failover Testing**
+
+Monitor K8s pod deletions and correlate with latency spikes:
+
+```yaml
+scenario:
+  executor:
+    type: constant-rate
+    rate: 1000
+    duration: 300s
+
+  events:
+    - source: k8s
+      namespace: tidb-cluster
+      watch:
+        - resource: pods
+          event_type: delete
+      action:
+        type: observe    # Just record timestamp, don't change rate
+```
+
+**Result**:
+```
+Timeline:
+  0-60s:     Normal (p99: 5ms, no events)
+  60s:       K8s Event: pod/tidb-0 deleted
+  60-75s:    Latency spike (p99: 2000ms)  ← Failover in progress
+  75-300s:   Recovered (p99: 8ms)
+
+Correlation: Latency spike directly caused by pod deletion (failover)
+```
+
+**Use Case 2: Rolling Upgrade Testing**
+
+Reduce load during rolling upgrades:
+
+```yaml
+scenario:
+  events:
+    - source: k8s
+      watch:
+        - resource: deployments
+          event_type: update
+      action:
+        type: rate_change
+        rate: 500       # Reduce to 50% during upgrade
+
+    - source: timer
+      schedule:
+        - at: 180s
+          action:
+            type: rate_change
+            rate: 1000   # Resume normal load after 3 minutes
+```
+
+**Use Case 3: Chaos Engineering Integration**
+
+Receive events from Chaos Mesh or Litmus Chaos:
+
+```yaml
+scenario:
+  events:
+    - source: webhook
+      port: 8090
+      actions:
+        - filter: '$.chaos_type == "network_partition"'
+          action:
+            type: observe
+
+        - filter: '$.chaos_type == "cpu_stress"'
+          action:
+            type: rate_change
+            rate: 2000   # Increase load during CPU stress
+```
+
+**Use Case 4: Time-Based Load Patterns**
+
+Simulate daily traffic patterns:
+
+```yaml
+scenario:
+  executor:
+    type: constant-rate
+    rate: 100           # Start low (night)
+    duration: 3600s     # 1 hour test
+
+  events:
+    - source: timer
+      schedule:
+        - at: 900s      # 15 min: morning ramp
+          action: { type: rate_change, rate: 1000 }
+
+        - at: 1800s     # 30 min: peak hours
+          action: { type: rate_change, rate: 5000 }
+
+        - at: 2700s     # 45 min: evening ramp down
+          action: { type: rate_change, rate: 500 }
+```
+
+---
+
+#### 5.6.5 Benefits of Parallel Event Module
+
+**1. Clean Separation of Concerns**:
+- Scenario Module: Workload execution logic
+- Event Module: External event monitoring
+- No tight coupling between modules
+
+**2. Composability**:
+```rust
+// Scenario can run standalone
+let result = scenario.execute().await?;
+
+// Or with events attached
+scenario.attach_event_stream(event_rx);
+let result = scenario.execute().await?;
+```
+
+**3. Extensibility**:
+```rust
+// Easy to add new event sources
+impl EventWatcher for PrometheusAlertWatcher {
+    async fn watch(&self, tx: mpsc::Sender<Event>) -> Result<()> {
+        // Watch Prometheus alerts
+    }
+}
+```
+
+**4. Testability**:
+```rust
+#[tokio::test]
+async fn test_scenario_reacts_to_rate_change_event() {
+    let (tx, rx) = mpsc::channel(10);
+    let mut scenario = create_test_scenario(rx);
+
+    // Inject event
+    tx.send(Event::RateChange(2000)).await.unwrap();
+
+    // Verify scenario adjusted rate
+    scenario.step().await.unwrap();
+    assert_eq!(scenario.rate_limiter.current_rate(), 2000);
+}
+```
+
+**5. Distributed Mode Compatibility**:
+- In distributed mode, **only leader** receives events
+- Leader broadcasts phase changes to workers via gRPC
+- Workers don't need direct K8s access
+
+---
+
+#### 5.6.6 Implementation Status
+
+**M0** (Current):
+- ✅ Timer event source (simple, no external dependencies)
+- ✅ Event channel integration in Scenario Module
+- ✅ Basic event handling (rate change, phase transition)
+
+**M1** (Future):
+- ⏭️ K8s event watcher
+- ⏭️ Webhook listener
+- ⏭️ Event correlation in metrics output
+- ⏭️ Distributed mode event broadcasting (leader → workers)
+
+**M2+** (Advanced):
+- ⏭️ Prometheus alert integration
+- ⏭️ CloudWatch event integration
+- ⏭️ Custom event filters (CEL expressions)
+- ⏭️ Event replay for reproducible testing
 
 ---
 
@@ -1623,6 +2309,719 @@ metrics.record_coordinated_omission(co_delay);
 ```
 
 **Reference**: Gil Tene's "How NOT to Measure Latency" (https://www.youtube.com/watch?v=lJ8ydIuPFeU)
+
+### 11.8 Distributed M:N Architecture (M1+)
+
+**Motivation**: Test distributed SQL databases (TiDB, CockroachDB, YugabyteDB) with multi-region awareness
+
+**Architecture**: M clients (1 leader + M-1 workers) → N database endpoints
+
+#### M:N Mapping Model
+
+**Key Concepts**:
+- **M clients**: Multiple RSBench instances coordinating to drive load
+- **1 leader**: Orchestrates phase transitions, aggregates metrics
+- **M-1 workers**: Execute workload independently based on leader instructions
+- **N endpoints**: Database endpoints (e.g., 3 TiDB regions, 5 CockroachDB nodes)
+
+---
+
+#### Loose Coordination Design Philosophy
+
+**Critical Design Principle**: RSBench uses **loose coordination**, NOT tight synchronization.
+
+**Motivation: Why Loose Coordination?**
+
+Traditional distributed testing tools use tight synchronization:
+```
+❌ TIGHT SYNC (What Others Do):
+  - Workers wait for global barriers
+  - All workers must sync at every phase
+  - Clock synchronization required (NTP drift issues)
+  - Failure of one worker blocks all workers
+  - Complex consensus protocols (Raft, Paxos)
+  - High coordination overhead
+```
+
+RSBench uses loose coordination:
+```
+✅ LOOSE COORDINATION (RSBench):
+  - Workers are independent after initial assignment
+  - Phase transitions coordinated, but not synchronized
+  - No clock synchronization required
+  - Worker failure doesn't block others
+  - Simple gRPC communication (no consensus)
+  - Minimal coordination overhead
+```
+
+**Design Rationale**:
+
+1. **Simplicity Over Perfection**:
+   - Exact synchronization is not needed for load testing
+   - Slight phase drift (1-2 seconds) doesn't affect results
+   - Simple gRPC calls vs. complex distributed consensus
+   - Easier to debug, easier to understand
+
+2. **Fault Tolerance**:
+   ```rust
+   // Tight sync (fragile)
+   await_all_workers_ready();  // If one fails, all block forever
+
+   // Loose coordination (resilient)
+   notify_workers(Phase::Execute);  // Fire-and-forget, workers handle independently
+   ```
+
+3. **Performance**:
+   - No global barriers in hot path
+   - Workers never wait for each other during execution
+   - Only coordination: prepare → execute → collect phases
+
+4. **Realistic Load Generation**:
+   - Real-world clients don't synchronize perfectly
+   - Slight phase drift models realistic traffic patterns
+   - No artificial lockstep behavior
+
+**What IS Coordinated (Minimal)**:
+
+1. **Phase Boundaries** (3 sync points in entire test):
+   ```
+   Leader → Workers: "PREPARE"   (wait for ready ACK)
+   Leader → Workers: "EXECUTE"   (broadcast start time, don't wait)
+   Leader → Workers: "COLLECT"   (wait for results)
+   ```
+
+2. **Routing Assignments** (once at startup):
+   ```
+   Leader → Worker 1: "Use workers [0-49] → endpoint 0"
+   Leader → Worker 2: "Use workers [50-99] → endpoint 1"
+   ```
+
+3. **Metrics Aggregation** (once at end):
+   ```
+   Leader ← Workers: Send ScenarioResult
+   Leader: Merge histograms, sum counters
+   ```
+
+**What IS NOT Coordinated (Independent)**:
+
+1. **Operation Execution**:
+   - Each worker runs at its own pace
+   - No synchronization between operations
+   - No global rate limiter (each worker has local rate limiter)
+
+2. **Clock Synchronization**:
+   - No NTP requirement
+   - Start times are relative, not absolute
+   - Slight drift (1-2s) is acceptable and expected
+
+3. **Workload State**:
+   - Each worker has independent RNG (seeded differently)
+   - No shared state during execution
+   - Operations are deterministic per worker, not globally
+
+4. **Connection Management**:
+   - Each worker manages its own connection pool
+   - No global connection coordination
+   - Each worker saturates independently
+
+**Implementation: Loose Coordination via gRPC**
+
+```rust
+// Leader side (simple fire-and-forget)
+impl LeaderOrchestrator {
+    async fn broadcast_phase(&self, phase: Phase) -> Result<()> {
+        let workers = self.workers.read().await;
+
+        for worker_addr in workers.iter() {
+            let client = WorkerClient::connect(worker_addr.clone()).await?;
+
+            // Fire-and-forget (don't wait for completion)
+            tokio::spawn(async move {
+                if let Err(e) = client.notify_phase(phase.clone()).await {
+                    tracing::warn!("Worker {} failed to receive phase: {}", worker_addr, e);
+                    // Don't fail entire test, just log warning
+                }
+            });
+        }
+
+        Ok(())
+    }
+
+    async fn collect_results(&self) -> Result<Vec<ScenarioResult>> {
+        let workers = self.workers.read().await;
+        let mut handles = vec![];
+
+        for worker_addr in workers.iter() {
+            let client = WorkerClient::connect(worker_addr.clone()).await?;
+
+            // Parallel collection with timeout
+            let handle = tokio::spawn(async move {
+                tokio::time::timeout(
+                    Duration::from_secs(30),
+                    client.get_results()
+                ).await
+            });
+
+            handles.push(handle);
+        }
+
+        // Collect results, skip failed workers
+        let mut results = vec![];
+        for handle in handles {
+            match handle.await {
+                Ok(Ok(Ok(result))) => results.push(result),
+                _ => {
+                    tracing::warn!("Failed to collect result from worker (timeout or error)");
+                    // Continue with other workers
+                }
+            }
+        }
+
+        Ok(results)
+    }
+}
+
+// Worker side (autonomous execution)
+impl WorkerExecutor {
+    async fn run(&mut self) -> Result<()> {
+        // Wait for PREPARE phase
+        let assignment = self.wait_for_assignment().await?;
+        self.setup(assignment).await?;
+        self.send_ready().await?;
+
+        // Wait for EXECUTE phase
+        self.wait_for_execute_phase().await?;
+
+        // Execute INDEPENDENTLY (no further coordination)
+        let result = self.scenario.execute().await?;
+
+        // Store result for leader to collect later
+        self.result = Some(result);
+
+        Ok(())
+    }
+}
+```
+
+**Comparison Table**:
+
+| Aspect | Tight Sync (Traditional) | Loose Coordination (RSBench) |
+|--------|--------------------------|------------------------------|
+| **Sync Points** | Every operation or batch | 3 total (prepare, execute, collect) |
+| **Clock Sync** | Required (NTP, PTP) | Not required |
+| **Worker Failure** | Blocks all workers | Logged, test continues |
+| **Coordination Protocol** | Consensus (Raft, Paxos) | Simple gRPC calls |
+| **Implementation Complexity** | High (1000+ lines) | Low (~200 lines) |
+| **Hot Path Overhead** | High (barriers, locks) | Zero (no coordination during execution) |
+| **Phase Drift Tolerance** | None (must be exact) | 1-2 seconds acceptable |
+| **Realistic Load** | No (lockstep artificial) | Yes (models real clients) |
+
+**Benefits of Loose Coordination**:
+
+1. **Simplicity**:
+   - No distributed consensus
+   - No clock sync requirements
+   - Easy to understand and debug
+
+2. **Fault Tolerance**:
+   - Worker failure doesn't halt test
+   - Leader failure → workers continue local execution
+   - Partial results still useful
+
+3. **Performance**:
+   - Zero hot path overhead
+   - No barriers or locks
+   - Each worker runs at full speed
+
+4. **Scalability**:
+   - Coordination overhead is O(1), not O(M×N)
+   - Can scale to 10+ clients without performance impact
+   - No coordination during execution (only at boundaries)
+
+5. **Realism**:
+   - Models real-world client behavior
+   - No artificial synchronization
+   - Natural load distribution
+
+**Trade-offs (Acceptable)**:
+
+1. **Phase Drift**: Workers may start execution 1-2 seconds apart
+   - **Impact**: Negligible for tests > 60 seconds
+   - **Mitigation**: Use longer test durations (5+ minutes)
+
+2. **No Global Rate Limiter**: Each worker maintains target rate independently
+   - **Impact**: Total rate may fluctuate ±5%
+   - **Mitigation**: Use more workers for smoother total rate
+
+3. **Partial Results on Failure**: If worker crashes, leader may not get its results
+   - **Impact**: Results from other workers still valid
+   - **Mitigation**: Log warnings, report partial metrics
+
+**Why This Is the Right Trade-off**:
+
+For database load testing:
+- Exact synchronization **NOT required** (we're measuring database, not testing distributed consensus)
+- Simplicity **IS required** (tool must be maintainable and debuggable)
+- Fault tolerance **IS required** (long-running tests shouldn't fail due to one worker crash)
+- Realism **IS valuable** (real clients don't synchronize perfectly)
+
+Therefore: **Loose coordination is the optimal design**
+
+---
+
+**Example: TiDB 3-Region Test**
+
+```
+┌─────────────────────────────────────────────────────────────────┐
+│                    Distributed Test Setup                       │
+│                                                                  │
+│  M = 3 Clients                         N = 3 DB Endpoints       │
+│  ┌─────────────┐                      ┌──────────────────┐      │
+│  │ Leader      │                      │ TiDB Region 1    │      │
+│  │ (Client 1)  │──────────────────────► (us-west-1)      │      │
+│  │ Workers: 50 │                      │ 192.168.1.10     │      │
+│  └─────────────┘                      └──────────────────┘      │
+│        │                                                         │
+│        │ gRPC coordination              ┌──────────────────┐      │
+│        │                                │ TiDB Region 2    │      │
+│        ├────────────────┐               │ (us-east-1)      │      │
+│        │                │               │ 192.168.2.10     │      │
+│        ▼                ▼               └──────────────────┘      │
+│  ┌─────────────┐  ┌─────────────┐                               │
+│  │ Worker      │  │ Worker      │     ┌──────────────────┐      │
+│  │ (Client 2)  │  │ (Client 3)  │     │ TiDB Region 3    │      │
+│  │ Workers: 50 │  │ Workers: 50 │────►│ (eu-west-1)      │      │
+│  └─────────────┘  └─────────────┘     │ 192.168.3.10     │      │
+│                                        └──────────────────┘      │
+│  Total: 150 async task workers                                  │
+│  Coordinated across 3 client instances                          │
+│  Routing to 3 database endpoints                                │
+└─────────────────────────────────────────────────────────────────┘
+```
+
+#### Configuration Schema
+
+**Infrastructure Config** (`config/rsbench.config.yaml`):
+
+```yaml
+database:
+  driver: mysql
+  endpoints:  # N endpoints
+    - host: 192.168.1.10  # Region 1 (us-west-1)
+      port: 4000
+      database: sbtest
+      region: us-west-1
+      role: readwrite
+
+    - host: 192.168.2.10  # Region 2 (us-east-1)
+      port: 4000
+      database: sbtest
+      region: us-east-1
+      role: readwrite
+
+    - host: 192.168.3.10  # Region 3 (eu-west-1)
+      port: 4000
+      database: sbtest
+      region: eu-west-1
+      role: readonly      # Read replica
+
+runtime:
+  type: async
+  max_connections: 200  # Per client
+  connection_strategy: multi-endpoint  # Enable M:N routing
+
+distributed:
+  mode: leader  # or 'worker' or 'standalone'
+  leader_address: "192.168.100.1:8080"  # gRPC address
+  worker_id: 1  # Unique worker ID (1 for leader)
+```
+
+**Scenario Config** (`scenarios/distributed_load_test.yaml`):
+
+```yaml
+scenario:
+  executor:
+    type: constant-rate
+    rate: 3000              # Total rate across all M clients
+    duration: 300s
+    workers: 150            # Total workers distributed across M clients
+
+  workload:
+    type: declarative
+    file: workloads/oltp_read_write.yaml
+
+  routing:
+    strategy: region-affinity  # Route based on region preference
+    affinity_map:
+      - worker_range: [0, 49]
+        endpoint: 0         # Workers 0-49 → Region 1
+      - worker_range: [50, 99]
+        endpoint: 1         # Workers 50-99 → Region 2
+      - worker_range: [100, 149]
+        endpoint: 2         # Workers 100-149 → Region 3
+```
+
+#### Routing Strategies
+
+**1. Region Affinity** (default for distributed databases):
+```yaml
+routing:
+  strategy: region-affinity
+  affinity_map:
+    - worker_range: [0, 49]
+      endpoint: 0  # Workers 0-49 prefer Region 1
+    - worker_range: [50, 99]
+      endpoint: 1  # Workers 50-99 prefer Region 2
+```
+
+**Benefits**: Models real-world geographic distribution, tests cross-region latency
+
+**2. Cross-Region** (test distributed transactions):
+```yaml
+routing:
+  strategy: cross-region
+  distribution:
+    - endpoint: 0
+      weight: 33  # 33% to Region 1
+    - endpoint: 1
+      weight: 33  # 33% to Region 2
+    - endpoint: 2
+      weight: 34  # 34% to Region 3
+```
+
+**Benefits**: Tests distributed consensus, cross-region transaction performance
+
+**3. Read-Write Split**:
+```yaml
+routing:
+  strategy: read-write-split
+  read_endpoints: [0, 1, 2]   # All regions for reads
+  write_endpoints: [0]         # Only Region 1 for writes
+  read_weight: 0.8            # 80% reads
+```
+
+**Benefits**: Models real-world read-heavy workloads, tests read scaling
+
+#### Leader Responsibilities
+
+**Leader Instance** runs on one client machine:
+
+1. **Worker Discovery**:
+   ```rust
+   // Leader discovers all M worker clients
+   let workers = discover_workers(config.distributed.worker_addresses).await?;
+   // workers = [worker_1, worker_2, worker_3]
+   ```
+
+2. **M:N Routing Assignment**:
+   ```rust
+   // Assign worker_id ranges to each client
+   // Client 1 (leader): workers [0-49]   → endpoint 0
+   // Client 2: workers [50-99]  → endpoint 1
+   // Client 3: workers [100-149] → endpoint 2
+
+   for (client_id, client_addr) in workers.iter().enumerate() {
+       let assignment = WorkerAssignment {
+           worker_id_start: client_id * 50,
+           worker_id_end: (client_id + 1) * 50,
+           endpoint_index: client_id % endpoints.len(),
+       };
+       send_assignment(client_addr, assignment).await?;
+   }
+   ```
+
+3. **Phase Orchestration**:
+   ```rust
+   // Leader broadcasts phase transitions
+   async fn execute_distributed(&mut self) -> Result<ScenarioResult> {
+       // Phase 1: Prepare
+       broadcast_phase(Phase::Prepare).await?;
+       wait_for_ready().await?;
+
+       // Phase 2: Execute
+       broadcast_phase(Phase::Execute { start_time: Instant::now() }).await?;
+
+       // Run local workload
+       self.execute_local_workload().await?;
+
+       // Phase 3: Collect
+       broadcast_phase(Phase::Collect).await?;
+       let worker_results = collect_worker_results().await?;
+
+       // Aggregate results
+       aggregate_results(worker_results)
+   }
+   ```
+
+4. **Metrics Aggregation**:
+   ```rust
+   fn aggregate_results(worker_results: Vec<ScenarioResult>) -> ScenarioResult {
+       let total_ops = worker_results.iter().map(|r| r.operations_completed).sum();
+       let total_errors = worker_results.iter().map(|r| r.errors).sum();
+
+       // Merge HDR histograms
+       let mut merged_histogram = Histogram::new(...);
+       for result in &worker_results {
+           merged_histogram.add(&result.latency_histogram)?;
+       }
+
+       ScenarioResult {
+           operations_completed: total_ops,
+           errors: total_errors,
+           duration: worker_results[0].duration,  // Same for all workers
+           latency_histogram: merged_histogram,
+           // ... per-endpoint breakdown
+       }
+   }
+   ```
+
+#### Worker Implementation
+
+**Worker Instance** (on each non-leader client):
+
+```rust
+pub struct DistributedScenarioExecutor {
+    mode: DistributedMode,
+    local_executor: ScenarioExecutor,
+    leader_client: Option<LeaderClient>,  // gRPC client to leader
+    endpoint_assignment: Option<usize>,   // Which endpoint to use
+}
+
+impl DistributedScenarioExecutor {
+    pub async fn execute(&mut self) -> Result<ScenarioResult> {
+        match self.mode {
+            DistributedMode::Leader => self.execute_leader().await,
+            DistributedMode::Worker => self.execute_worker().await,
+            DistributedMode::Standalone => self.local_executor.execute().await,
+        }
+    }
+
+    async fn execute_worker(&mut self) -> Result<ScenarioResult> {
+        // Wait for leader assignment
+        let assignment = self.leader_client.receive_assignment().await?;
+
+        // Configure local executor with assigned endpoint
+        self.local_executor.set_endpoint(assignment.endpoint_index);
+        self.local_executor.set_worker_id_range(
+            assignment.worker_id_start,
+            assignment.worker_id_end
+        );
+
+        // Wait for execute phase
+        self.leader_client.wait_for_phase(Phase::Execute).await?;
+
+        // Execute local workload
+        let result = self.local_executor.execute().await?;
+
+        // Send results to leader
+        self.leader_client.send_results(result.clone()).await?;
+
+        Ok(result)
+    }
+}
+```
+
+#### Multi-Endpoint Connection Pool
+
+```rust
+pub struct MultiEndpointPool {
+    endpoints: Vec<EndpointPool>,
+    routing_strategy: RoutingStrategy,
+}
+
+impl MultiEndpointPool {
+    pub async fn get(&self, worker_id: usize) -> Result<PooledConnection> {
+        let endpoint_index = self.routing_strategy.select(worker_id);
+        self.endpoints[endpoint_index].get().await
+    }
+}
+
+pub enum RoutingStrategy {
+    RegionAffinity(Vec<WorkerRange>),
+    CrossRegion(Vec<WeightedEndpoint>),
+    ReadWriteSplit { read: Vec<usize>, write: Vec<usize> },
+}
+```
+
+#### Metrics Breakdown
+
+**Per-Endpoint Metrics**:
+```
+Endpoint 0 (us-west-1):
+  Operations: 50000
+  Latency p99: 5ms
+  Errors: 12
+
+Endpoint 1 (us-east-1):
+  Operations: 50000
+  Latency p99: 45ms   ← Higher cross-region latency
+  Errors: 8
+
+Endpoint 2 (eu-west-1):
+  Operations: 50000
+  Latency p99: 95ms   ← Even higher cross-region latency
+  Errors: 120         ← Read replica experiencing issues
+```
+
+**Per-Worker Metrics** (for debugging):
+```
+Worker 0 (Client 1): 333 ops, 0 errors
+Worker 1 (Client 1): 334 ops, 0 errors
+...
+Worker 149 (Client 3): 333 ops, 0 errors
+```
+
+**Global Aggregated Metrics**:
+```
+Total Operations: 150000
+Total Errors: 140
+Global p99 Latency: 95ms
+Backpressure Events: 0
+```
+
+#### Scenario Module Integration
+
+**DistributedMode Enum**:
+
+```rust
+pub enum DistributedMode {
+    Standalone,  // M0: Single client, single endpoint
+    Leader {     // M1: Orchestrator
+        worker_addresses: Vec<String>,
+        leader_port: u16,
+    },
+    Worker {     // M1: Follower
+        leader_address: String,
+        worker_id: usize,
+    },
+}
+```
+
+**Configuration Flow**:
+
+```rust
+impl ScenarioExecutor {
+    pub fn new(config: ScenarioConfig) -> Result<Self> {
+        let distributed_mode = match &config.distributed {
+            None => DistributedMode::Standalone,
+            Some(d) if d.mode == "leader" => DistributedMode::Leader { ... },
+            Some(d) if d.mode == "worker" => DistributedMode::Worker { ... },
+            _ => return Err(Error::InvalidConfig),
+        };
+
+        // Create appropriate executor
+        match distributed_mode {
+            DistributedMode::Standalone => Self::new_standalone(config),
+            _ => Self::new_distributed(config, distributed_mode),
+        }
+    }
+}
+```
+
+#### Example: Complete TiDB 3-Region Test
+
+**Setup**:
+1. Deploy TiDB cluster across 3 regions (us-west-1, us-east-1, eu-west-1)
+2. Deploy 3 RSBench clients (one per region, co-located with TiDB)
+3. Designate one client as leader
+
+**Client 1 (Leader)** - us-west-1:
+```bash
+rsbench \
+  --config config/rsbench.config.yaml \
+  --scenario scenarios/distributed_load_test.yaml \
+  --distributed-mode leader \
+  --leader-port 8080
+```
+
+**Client 2 (Worker)** - us-east-1:
+```bash
+rsbench \
+  --config config/rsbench.config.yaml \
+  --scenario scenarios/distributed_load_test.yaml \
+  --distributed-mode worker \
+  --leader-address 192.168.100.1:8080 \
+  --worker-id 2
+```
+
+**Client 3 (Worker)** - eu-west-1:
+```bash
+rsbench \
+  --config config/rsbench.config.yaml \
+  --scenario scenarios/distributed_load_test.yaml \
+  --distributed-mode worker \
+  --leader-address 192.168.100.1:8080 \
+  --worker-id 3
+```
+
+**Execution Flow**:
+```
+[Leader] Discovering workers... Found 2 workers
+[Leader] Assigning worker ranges: [0-49], [50-99], [100-149]
+[Leader] Broadcasting PREPARE phase...
+[Worker 2] Received assignment: workers [50-99] → endpoint 1
+[Worker 3] Received assignment: workers [100-149] → endpoint 2
+[Leader] All workers ready. Broadcasting EXECUTE phase...
+[All] Executing workload for 300s...
+[Leader] Collecting results from workers...
+[Leader] Aggregating 3 result sets...
+[Leader] Final Results:
+  Total Operations: 900000 (3000 ops/sec × 300s)
+  Endpoint 0 (us-west-1): 300000 ops, p99: 5ms
+  Endpoint 1 (us-east-1): 300000 ops, p99: 45ms
+  Endpoint 2 (eu-west-1): 300000 ops, p99: 95ms
+```
+
+#### Event Integration (M1)
+
+Distributed mode integrates with event module for advanced scenarios:
+
+```yaml
+scenario:
+  executor:
+    type: constant-rate
+    rate: 3000
+    duration: 600s
+
+  events:
+    - source: k8s
+      watch:
+        - namespace: tidb
+          resource: pod
+          event_type: delete  # Failover event
+      action:
+        phase: observe      # Don't change rate, just observe
+
+    - time: 300s
+      action:
+        phase: change_routing
+        routing:
+          strategy: cross-region  # Switch to cross-region after 5min
+```
+
+**Failover Testing**:
+```
+Timeline:
+  0-60s:    Normal load (region-affinity)
+  60s:      K8s pod delete (simulated failover)
+  60-90s:   High latency on endpoint 0 (failover in progress)
+  90-600s:  Recovered (TiDB rebalanced)
+
+Metrics show:
+  Endpoint 0 latency p99: 5ms → 2000ms → 8ms
+  Backpressure events: 0 → 450 → 0
+```
+
+#### Benefits of M:N Architecture
+
+1. **Realistic Distributed Testing**: Model real-world multi-region deployments
+2. **Scalability**: M clients can drive more load than single client
+3. **Region Awareness**: Test region-specific performance characteristics
+4. **Failover Testing**: Observe behavior during region failures
+5. **Cross-Region Latency**: Measure distributed transaction overhead
+6. **Read Scaling**: Test read replica performance
+7. **Coordinated Load**: All M clients start/stop simultaneously
+8. **Aggregated Metrics**: Single unified result across M clients
 
 ---
 

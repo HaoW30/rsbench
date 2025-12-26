@@ -175,6 +175,197 @@ pub async fn execute(&mut self) -> Result<Vec<ScenarioResult>> {
 
 ## Architecture Summary
 
+### Key Architectural Innovations
+
+**1. Worker Model: Async Tasks, Not OS Threads**
+
+RSBench uses **Tokio async tasks (green threads)** for workers, NOT OS threads like sysbench:
+
+```
+User Config: workers: 100
+      ↓
+100 Tokio async tasks (~2KB stack each)
+      ↓
+Scheduled on 8 OS threads (tokio runtime)
+      ↓
+Non-blocking async I/O
+```
+
+**Comparison:**
+
+| Aspect | Sysbench --threads=100 | RSBench workers: 100 |
+|--------|------------------------|----------------------|
+| **OS Threads** | 100 | 4-8 (tokio runtime) |
+| **Memory** | ~800 MB (thread stacks) | ~20 MB (async tasks) |
+| **Context Switches** | High (100 threads) | Low (8 threads) |
+| **I/O Model** | Blocking (thread waits) | Async (task yields) |
+| **Scalability Limit** | ~500 threads (OS limit) | ~10K workers (memory limit) |
+
+**Why This Matters:**
+- Simulate 1000 concurrent users with only 8 OS threads
+- 40x less memory than sysbench for same concurrency
+- No context switch overhead
+- Can scale to 10K+ workers for extreme load tests
+
+**2. Backpressure Awareness: Client Saturation is Visible**
+
+Traditional tools **hide backpressure** by blocking threads. RSBench **makes it visible**:
+
+**What is Backpressure?**
+- Backpressure = RSBench (client) is saturated, NOT the database
+- Occurs when connection pool exhausted or runtime semaphore full
+- Invalid test results - you're measuring client limits, not database performance
+
+**How RSBench Detects Backpressure:**
+1. **Pool Utilization Monitoring**: Tracks when pool > 80% utilized (configurable)
+2. **Semaphore Saturation**: Detects when no permits available
+3. **Explicit Metrics**: backpressure_events counter, backpressure_percentage
+
+**Example Metrics:**
+```
+Client Metrics:
+  Backpressure Events: 5420    ⚠️ HIGH - Results may be invalid!
+  Backpressure %: 9.0%
+  Pool Utilization p99: 98.2%  ⚠️ Client saturated
+```
+
+**Interpreting Results:**
+- **0-1% backpressure**: ✅ Valid results - measuring database
+- **1-5%**: ⚠️ Minor skew - consider increasing max_connections
+- **5-20%**: ❌ Invalid - measuring client limits, not database
+- **>20%**: ❌ Completely invalid - significantly increase max_connections
+
+**Why This Matters:**
+- Sysbench hides client saturation → you don't know if results are valid
+- RSBench shows backpressure → you know when to increase client capacity
+- Distinguish client bottlenecks from database bottlenecks
+- Prevents coordinated omission problem
+
+**3. M:N Distributed Architecture: Multi-Region Testing with Loose Coordination**
+
+For distributed SQL databases (TiDB, CockroachDB, YugabyteDB), RSBench supports **M clients → N database endpoints**:
+
+```
+M = 3 Clients (1 leader + 2 workers)
+      ↓
+N = 3 Database Endpoints (us-west, us-east, eu-west)
+
+Leader (Client 1):
+  - Discovers all M worker clients
+  - Assigns worker_id ranges to each client
+  - Orchestrates phase transitions (prepare → execute → collect)
+  - Aggregates metrics from all workers
+
+Workers (Client 2, 3):
+  - Receive endpoint assignments from leader
+  - Execute workload INDEPENDENTLY (no further coordination)
+  - Report results back to leader
+
+Total: 150 async task workers across 3 clients → 3 regions
+```
+
+**Critical Design: Loose Coordination, NOT Tight Sync**
+
+RSBench uses **loose coordination** for simplicity and fault tolerance:
+
+```
+✅ LOOSE COORDINATION (RSBench):
+  - Only 3 sync points: prepare → execute → collect
+  - Workers run independently after initial assignment
+  - No clock synchronization required (NTP not needed)
+  - Worker failure doesn't block others
+  - Simple gRPC calls (no consensus protocols)
+  - Zero hot path overhead
+
+❌ TIGHT SYNC (Traditional Tools):
+  - Global barriers at every operation/batch
+  - Clock synchronization required (NTP, PTP)
+  - Worker failure blocks all workers
+  - Complex consensus (Raft, Paxos)
+  - High coordination overhead
+```
+
+**What IS Coordinated:**
+1. Phase boundaries (3 sync points total)
+2. Routing assignments (once at startup)
+3. Metrics aggregation (once at end)
+
+**What IS NOT Coordinated:**
+1. Operation execution (each worker runs at its own pace)
+2. Clock synchronization (slight drift 1-2s is acceptable)
+3. Workload state (independent RNG per worker)
+4. Connection management (each worker has own pool)
+
+**Why Loose Coordination:**
+- **Simplicity**: ~200 lines vs ~1000+ lines for tight sync
+- **Fault Tolerance**: Worker failure doesn't halt test
+- **Performance**: Zero hot path overhead (no barriers during execution)
+- **Realism**: Real clients don't synchronize perfectly
+
+**Routing Strategies:**
+1. **Region Affinity**: Workers 0-49 → Region 1, 50-99 → Region 2, 100-149 → Region 3
+   - Models real-world geographic distribution
+2. **Cross-Region**: Distribute operations across all regions
+   - Tests distributed consensus, cross-region transactions
+3. **Read-Write Split**: Reads to all regions, writes to primary
+   - Models read-heavy workloads, tests read scaling
+
+**Why This Matters:**
+- Test multi-region latency characteristics
+- Simulate real-world geographic distribution
+- Coordinate failover testing across regions
+- Measure cross-region transaction overhead
+- Per-endpoint metrics show region-specific performance
+
+**4. Event Module: Parallel External Event Integration**
+
+RSBench has a **parallel Event Module** that runs alongside the Scenario Module (not nested inside it):
+
+```
+Architecture:
+  ┌──────────────┐        ┌──────────────┐
+  │   Scenario   │        │    Event     │  ← PARALLEL MODULES
+  │   Module     │◄───────│   Module     │
+  └──────────────┘  mpsc  └──────┬───────┘
+                          channel│
+                                 ├─► K8s Watcher
+                                 ├─► Webhook Listener
+                                 └─► Timer Events
+```
+
+**Why Parallel, Not Nested:**
+- ✅ **Separation of Concerns**: Event watching is independent from workload execution
+- ✅ **Composability**: Can run Scenario without Event Module (standalone mode)
+- ✅ **Testability**: Can test modules independently
+- ✅ **Reusability**: Same Event Module works with any Scenario executor
+
+**Communication**: Event Module → Scenario via `tokio::mpsc` channel
+
+**Event Sources:**
+1. **K8s Watcher** (M1+): Watch pod/deployment events (failover, upgrades)
+2. **Webhook Listener** (M1+): Receive events from Chaos Mesh, Prometheus, custom tools
+3. **Timer Events** (M0): Time-based phase transitions
+
+**How Scenario Reacts:**
+```rust
+// Scenario checks for events (non-blocking)
+if let Ok(event) = event_rx.try_recv() {
+    match event {
+        Event::RateChange(rate) => self.rate_limiter.set_rate(rate),
+        Event::PhaseTransition(Phase::Pause) => self.paused = true,
+        Event::K8sEvent { .. } => /* record timestamp for correlation */,
+    }
+}
+```
+
+**Use Cases:**
+- Failover testing: Monitor K8s pod deletion, correlate with latency spikes
+- Rolling upgrade testing: Reduce load during upgrades
+- Chaos engineering: Receive events from Chaos Mesh, adjust load
+- Time-based patterns: Simulate daily traffic (night → morning → peak → evening)
+
+**Key Design Point**: In distributed mode, **only leader** receives events and broadcasts phase changes to workers
+
 ### Module Organization
 
 ```
@@ -497,11 +688,23 @@ See `docs/workload-design.md` for complete specification.
   - Separate client bottlenecks from DB performance
 
 ### 8. Scenario Module (`src/scenario.rs`)
-- **Purpose**: Orchestrate workload execution
-- **Executors** (M0):
-  - `ConstantRate`: Fixed ops/sec
-  - `RampingRate`: Staged rate changes
-- **Critical**: Time-driven scheduling via rate limiter
+- **Purpose**: Orchestrate workload execution with pluggable executor patterns
+- **Executors**:
+  - **Open-Loop** (M0): Time-driven, fire-and-forget submission
+    - `ConstantRate`: Fixed ops/sec (e.g., rate: 1000)
+    - `RampingRate`: Staged rate changes (capacity testing)
+  - **Closed-Loop** (M0/M1): Worker-driven sequential execution
+    - Equivalent to sysbench `--threads=N` (each worker waits for completion)
+    - Natural backpressure modeling (slow queries → lower throughput)
+- **Distributed Mode** (M1+): M:N architecture
+  - M clients (1 leader + M-1 workers) coordinate to drive load
+  - N database endpoints (multi-region, read replicas)
+  - Leader orchestrates phases, aggregates metrics
+  - Routing strategies: region-affinity, cross-region, read-write-split
+- **Critical**:
+  - Time-driven scheduling via rate limiter (open-loop)
+  - Worker-driven execution (closed-loop)
+  - Event integration for lifecycle testing
 
 ## Milestone Status
 
@@ -787,6 +990,15 @@ match &self.config.executor {
 - **API Spec**: `docs/api_spec_m0.md` - Detailed API specification
 - **Structure**: `docs/project_structure.md` - Module organization
 - **Progress**: `docs/m0_progress_summary.md` - Current status
+- **Scenario Design**: `docs/scenario-design.md` - Comprehensive scenario module design
+  - Section 2.4: Worker Architecture and Scalability
+  - Section 5.3.2: Backpressure Awareness Deep Dive
+  - Section 5.6: Event Module Integration (Parallel Module Design)
+  - Section 11.1: Closed-Loop Executor (BlockingRuntime Replacement)
+  - Section 11.8: Distributed M:N Architecture with Loose Coordination
+  - Appendix C: Sysbench Migration Guide
+- **Executor Pattern Decision**: `docs/executor-pattern-decision.md` - Architectural Decision Record
+- **Documentation Updates**: `docs/DOCUMENTATION_UPDATES.md` - Summary of all doc changes
 - **Workload Design**: `docs/workload-design.md` - Declarative workload specification
 - **Migration Guide**: `docs/declarative-workload-migration.md` - Builtin to declarative migration
 - **Config Guide**: `config/README.md` - Infrastructure configuration guide
@@ -873,5 +1085,14 @@ Or install LuaJIT and build with: `cargo build --features lua`
 ---
 
 **Project Version**: M0 Alpha
-**Last Updated**: 2025-12-24
+**Last Updated**: 2025-12-26
 **Status**: Module structure complete, implementation in progress
+
+**Recent Updates (2025-12-26)**:
+- ✅ Added comprehensive backpressure awareness documentation
+- ✅ Added M:N distributed architecture design with loose coordination philosophy (M1 feature)
+- ✅ Added Event Module integration as parallel module (not nested)
+- ✅ Clarified worker model (async tasks vs OS threads)
+- ✅ Added executor pattern decision (closed-loop vs open-loop)
+- ✅ Created Sysbench migration guide with complete command mapping
+- ✅ Documented loose coordination design rationale (simplicity, fault tolerance, performance)
