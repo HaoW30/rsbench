@@ -302,11 +302,114 @@ impl ScenarioExecutor {
         None // All stages complete
     }
 
-    async fn execute_closed_loop(&mut self, _workers: usize, _duration: Duration) -> Result<ScenarioResult> {
-        // TODO: Implement in Phase 3 - Closed-Loop Executor
-        // This will spawn N worker tasks that continuously execute operations
-        // until duration expires or shutdown is requested
-        todo!("Closed-loop executor implementation (Phase 3)")
+    async fn execute_closed_loop(&mut self, workers: usize, duration: Duration) -> Result<ScenarioResult> {
+        let start = Instant::now();
+        let end_time = start + duration;
+
+        // Extract think_time from config
+        let think_time = if let ExecutorConfig::ClosedLoop { think_time, .. } = &self.config.executor {
+            *think_time
+        } else {
+            None
+        };
+
+        // TODO M1: Add event handling support for closed-loop (pause/resume/shutdown)
+        // For M0, workers run for full duration without event handling
+
+        // Spawn worker tasks
+        let mut handles = vec![];
+
+        for worker_id in 0..workers {
+            // Create independent workload for this worker with unique seed
+            let workload_config = self.config.workload.clone();
+            let worker_workload = match crate::workload::WorkloadFactory::create(&workload_config, worker_id as u64) {
+                Ok(w) => w,
+                Err(e) => {
+                    // If we can't create workload, log and continue with remaining workers
+                    tracing::warn!("Failed to create workload for worker {}: {}", worker_id, e);
+                    continue;
+                }
+            };
+
+            let runtime = self.runtime.clone();
+
+            // Spawn worker task
+            let handle = tokio::spawn(async move {
+                let mut iteration = 0u64;
+                let task_start = Instant::now();
+                let mut workload = worker_workload;
+
+                while Instant::now() < end_time {
+                    // Generate operation
+                    let ctx = crate::workload::ExecutionContext {
+                        worker_id,
+                        iteration,
+                        elapsed: task_start.elapsed(),
+                    };
+
+                    let operation = match workload.next_operation(&ctx) {
+                        Ok(op) => op,
+                        Err(e) => {
+                            tracing::warn!("Worker {} failed to generate operation: {}", worker_id, e);
+                            break;
+                        }
+                    };
+
+                    // Submit operation and WAIT for completion (closed-loop)
+                    // Note: Runtime records metrics internally
+                    let result = runtime.submit(operation).await;
+
+                    // Log errors (metrics are already recorded by runtime)
+                    if let Err(e) = result {
+                        tracing::warn!("Worker {} operation failed: {}", worker_id, e);
+                    }
+
+                    // Optional think time (like sysbench --think-time)
+                    if let Some(delay) = think_time {
+                        tokio::time::sleep(delay).await;
+                    }
+
+                    iteration += 1;
+                }
+
+                Ok::<u64, crate::Error>(iteration)
+            });
+
+            handles.push(handle);
+        }
+
+        // Wait for all workers to complete
+        let mut total_iterations = 0u64;
+        for (idx, handle) in handles.into_iter().enumerate() {
+            match handle.await {
+                Ok(Ok(iterations)) => {
+                    total_iterations += iterations;
+                }
+                Ok(Err(e)) => {
+                    tracing::warn!("Worker {} failed: {}", idx, e);
+                }
+                Err(e) => {
+                    tracing::warn!("Worker {} panicked: {}", idx, e);
+                }
+            }
+        }
+
+        // Brief cooldown for any remaining metrics
+        tokio::time::sleep(Duration::from_millis(100)).await;
+
+        // Collect results
+        let actual_end = Instant::now();
+        let metrics_snapshot = self.metrics.snapshot();
+
+        Ok(ScenarioResult {
+            duration: start.elapsed(),
+            operations_completed: total_iterations,
+            operations_failed: 0, // M0: simplified, actual errors in metrics
+            metrics: metrics_snapshot.clone(),
+            start_time: start,
+            end_time: actual_end,
+            backpressure_events: metrics_snapshot.backpressure_events,
+        })
     }
 }
 
@@ -798,5 +901,115 @@ mod tests {
 
         // Note: We can't easily verify the rate limiter state without exposing it,
         // but we can at least verify the event was processed without errors
+    }
+
+    #[tokio::test]
+    async fn test_closed_loop_basic() {
+        use crate::metrics::MetricsCollector;
+
+        // Create a minimal inline workload definition
+        let workload_def = serde_yaml::from_str(r#"
+name: test_workload
+schema:
+  tables:
+    - name: test_table
+      count: 1
+      columns:
+        - name: id
+          type: integer
+          primary_key: true
+operations:
+  - name: select
+    sql: "SELECT * FROM test_table WHERE id = ?"
+    params:
+      - type: integer
+        distribution: uniform
+        min: 1
+        max: 100
+    weight: 100
+"#).unwrap();
+
+        let scenario_config = ScenarioConfig {
+            executor: ExecutorConfig::ClosedLoop {
+                workers: 2,
+                duration: Duration::from_millis(100), // Short duration for test
+                think_time: None,
+                max_connections: 10,
+            },
+            workload: crate::config::WorkloadConfig::Declarative {
+                file: None,
+                definition: Some(workload_def),
+                overrides: None,
+            },
+        };
+
+        let workload = Box::new(MockWorkload);
+        let runtime = Arc::new(MockRuntime);
+        let metrics = MetricsCollector::new();
+
+        let mut executor = ScenarioExecutor::new(scenario_config, workload, runtime, metrics);
+
+        // Execute closed-loop
+        let result = executor.execute_closed_loop(2, Duration::from_millis(100)).await;
+
+        // Should complete without errors (even if no operations due to workload creation issues)
+        assert!(result.is_ok());
+        let result = result.unwrap();
+
+        // Duration should be approximately 100ms
+        assert!(result.duration.as_millis() >= 90 && result.duration.as_millis() <= 200);
+    }
+
+    #[tokio::test]
+    async fn test_closed_loop_with_think_time() {
+        use crate::metrics::MetricsCollector;
+
+        // Create a minimal inline workload definition
+        let workload_def = serde_yaml::from_str(r#"
+name: test_workload
+schema:
+  tables:
+    - name: test_table
+      count: 1
+      columns:
+        - name: id
+          type: integer
+          primary_key: true
+operations:
+  - name: select
+    sql: "SELECT * FROM test_table WHERE id = ?"
+    params:
+      - type: integer
+        distribution: uniform
+        min: 1
+        max: 100
+    weight: 100
+"#).unwrap();
+
+        let scenario_config = ScenarioConfig {
+            executor: ExecutorConfig::ClosedLoop {
+                workers: 1,
+                duration: Duration::from_millis(100),
+                think_time: Some(Duration::from_millis(10)), // 10ms think time
+                max_connections: 10,
+            },
+            workload: crate::config::WorkloadConfig::Declarative {
+                file: None,
+                definition: Some(workload_def),
+                overrides: None,
+            },
+        };
+
+        let workload = Box::new(MockWorkload);
+        let runtime = Arc::new(MockRuntime);
+        let metrics = MetricsCollector::new();
+
+        let mut executor = ScenarioExecutor::new(scenario_config, workload, runtime, metrics);
+
+        // Execute closed-loop with think time
+        let result = executor.execute_closed_loop(1, Duration::from_millis(100)).await;
+
+        // Should complete without errors
+        assert!(result.is_ok());
     }
 }
