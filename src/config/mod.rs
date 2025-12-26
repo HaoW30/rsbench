@@ -167,6 +167,22 @@ impl ConfigLoader {
                     return Err(Error::Config("Executor max_connections must be > 0".into()));
                 }
             }
+            ExecutorConfig::ClosedLoop {
+                workers,
+                duration,
+                max_connections,
+                ..
+            } => {
+                if *workers == 0 {
+                    return Err(Error::Config("Executor workers must be > 0".into()));
+                }
+                if duration.as_secs() == 0 && duration.subsec_nanos() == 0 {
+                    return Err(Error::Config("Executor duration must be > 0".into()));
+                }
+                if *max_connections == 0 {
+                    return Err(Error::Config("Executor max_connections must be > 0".into()));
+                }
+            }
         }
 
         // Validate workload config
@@ -231,6 +247,12 @@ impl ConfigLoader {
                 ExecutorConfig::RampingRate { .. } => {
                     // For ramping rate, we can't easily override duration
                     // Could log a warning here in the future
+                }
+                ExecutorConfig::ClosedLoop {
+                    duration: ref mut config_duration,
+                    ..
+                } => {
+                    *config_duration = duration;
                 }
             }
         }
@@ -450,7 +472,7 @@ pub struct ScenarioConfig {
     pub workload: WorkloadConfig,
 }
 
-/// Executor configuration (M0: constant-rate and ramping-rate)
+/// Executor configuration (M0: constant-rate, ramping-rate, and closed-loop)
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(tag = "type", rename_all = "kebab-case")]
 pub enum ExecutorConfig {
@@ -473,6 +495,23 @@ pub enum ExecutorConfig {
         /// Preallocate connections
         #[serde(default = "default_prealloc")]
         prealloc_connections: usize,
+
+        /// Maximum concurrent connections
+        #[serde(default = "default_max_connections")]
+        max_connections: usize,
+    },
+    ClosedLoop {
+        /// Number of concurrent workers (async tasks, not OS threads)
+        /// Equivalent to sysbench --threads=N
+        workers: usize,
+
+        /// Test duration
+        #[serde(with = "humantime_serde")]
+        duration: Duration,
+
+        /// Optional think time between operations (like sysbench --think-time)
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        think_time: Option<Duration>,
 
         /// Maximum concurrent connections
         #[serde(default = "default_max_connections")]

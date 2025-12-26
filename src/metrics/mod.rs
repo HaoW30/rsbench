@@ -108,6 +108,7 @@ impl OperationMetrics {
 }
 
 /// Immutable metrics snapshot
+#[derive(Debug, Clone)]
 pub struct MetricsSnapshot {
     pub operation_metrics: HashMap<String, OperationMetricsSnapshot>,
     pub backpressure_events: u64,
@@ -115,7 +116,7 @@ pub struct MetricsSnapshot {
     pub timestamp: SystemTime,
 }
 
-#[derive(Clone)]
+#[derive(Debug, Clone)]
 pub struct OperationMetricsSnapshot {
     pub count: u64,
     pub errors: u64,

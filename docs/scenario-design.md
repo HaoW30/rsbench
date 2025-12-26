@@ -2320,6 +2320,8 @@ metrics.record_coordinated_omission(co_delay);
 
 **Key Concepts**:
 - **M clients**: Multiple RSBench instances coordinating to drive load
+  - **Scaling**: Can have multiple clients per region/AZ to drive higher QPS
+  - **Example**: 3 regions × 2 clients/region = 6 total clients (M=6)
 - **1 leader**: Orchestrates phase transitions, aggregates metrics
 - **M-1 workers**: Execute workload independently based on leader instructions
 - **N endpoints**: Database endpoints (e.g., 3 TiDB regions, 5 CockroachDB nodes)
@@ -2569,35 +2571,75 @@ Therefore: **Loose coordination is the optimal design**
 
 ---
 
-**Example: TiDB 3-Region Test**
+**Example: TiDB 3-Region Test with Multiple Clients per Region**
 
 ```
-┌─────────────────────────────────────────────────────────────────┐
-│                    Distributed Test Setup                       │
-│                                                                  │
-│  M = 3 Clients                         N = 3 DB Endpoints       │
-│  ┌─────────────┐                      ┌──────────────────┐      │
-│  │ Leader      │                      │ TiDB Region 1    │      │
-│  │ (Client 1)  │──────────────────────► (us-west-1)      │      │
-│  │ Workers: 50 │                      │ 192.168.1.10     │      │
-│  └─────────────┘                      └──────────────────┘      │
-│        │                                                         │
-│        │ gRPC coordination              ┌──────────────────┐      │
-│        │                                │ TiDB Region 2    │      │
-│        ├────────────────┐               │ (us-east-1)      │      │
-│        │                │               │ 192.168.2.10     │      │
-│        ▼                ▼               └──────────────────┘      │
-│  ┌─────────────┐  ┌─────────────┐                               │
-│  │ Worker      │  │ Worker      │     ┌──────────────────┐      │
-│  │ (Client 2)  │  │ (Client 3)  │     │ TiDB Region 3    │      │
-│  │ Workers: 50 │  │ Workers: 50 │────►│ (eu-west-1)      │      │
-│  └─────────────┘  └─────────────┘     │ 192.168.3.10     │      │
-│                                        └──────────────────┘      │
-│  Total: 150 async task workers                                  │
-│  Coordinated across 3 client instances                          │
-│  Routing to 3 database endpoints                                │
-└─────────────────────────────────────────────────────────────────┘
+┌─────────────────────────────────────────────────────────────────────┐
+│                 Distributed Test Setup (M=6, N=3)                   │
+│                                                                      │
+│  Region us-west-1          Region us-east-1         Region eu-west-1│
+│  ┌────────────┐            ┌────────────┐           ┌────────────┐ │
+│  │ Leader     │            │ Worker 2   │           │ Worker 4   │ │
+│  │ (Client 1) │            │ (Client 3) │           │ (Client 5) │ │
+│  │ 100 workers│            │ 100 workers│           │ 100 workers│ │
+│  └──────┬─────┘            └──────┬─────┘           └──────┬─────┘ │
+│         │                         │                        │        │
+│  ┌──────┴─────┐            ┌──────┴─────┐           ┌──────┴─────┐ │
+│  │ Worker 1   │            │ Worker 3   │           │ Worker 5   │ │
+│  │ (Client 2) │            │ (Client 4) │           │ (Client 6) │ │
+│  │ 100 workers│            │ 100 workers│           │ 100 workers│ │
+│  └──────┬─────┘            └──────┬─────┘           └──────┬─────┘ │
+│         │                         │                        │        │
+│         ▼                         ▼                        ▼        │
+│  ┌──────────────┐          ┌──────────────┐        ┌──────────────┐│
+│  │ TiDB Region 1│          │ TiDB Region 2│        │ TiDB Region 3││
+│  │ (us-west-1)  │          │ (us-east-1)  │        │ (eu-west-1)  ││
+│  │ 192.168.1.10 │          │ 192.168.2.10 │        │ 192.168.3.10 ││
+│  └──────────────┘          └──────────────┘        └──────────────┘│
+│                                                                      │
+│  M = 6 clients (2 per region for scaling)                          │
+│  N = 3 endpoints (1 per region)                                    │
+│  Total: 600 async task workers                                     │
+│  Per-region QPS: 2 clients × 1000 ops/sec = 2000 ops/sec           │
+│  Total QPS: 6000 ops/sec (2000/region × 3 regions)                 │
+└─────────────────────────────────────────────────────────────────────┘
 ```
+
+**Why Multiple Clients per Region/AZ?**
+
+1. **Higher QPS per Region**:
+   - Single client limited by CPU/network (even with async I/O)
+   - 2-4 clients per region can saturate database capacity
+   - Example: 1 client = 5K ops/sec, 2 clients = 10K ops/sec per region
+
+2. **Fault Tolerance**:
+   - If one client crashes in a region, others continue
+   - Partial results still provide region-level insights
+
+3. **Resource Limits**:
+   - Kubernetes pod resource limits (CPU, memory)
+   - Network limits per pod
+   - File descriptor limits
+
+4. **Even Distribution**:
+   - With 3 regions and 6 clients: perfectly balanced (2 per region)
+   - With 3 regions and 5 clients: 2-2-1 distribution (acceptable)
+
+**Scaling Formula**:
+```
+Total QPS = M clients × QPS per client
+Clients per region = M / N (rounded appropriately)
+Per-region QPS = (M / N) × QPS per client
+```
+
+**Example Scaling**:
+
+| Scenario | Regions (N) | Clients (M) | Clients/Region | QPS/Client | Total QPS |
+|----------|-------------|-------------|----------------|------------|-----------|
+| Light    | 3           | 3           | 1              | 1000       | 3K        |
+| Medium   | 3           | 6           | 2              | 2000       | 12K       |
+| Heavy    | 3           | 12          | 4              | 2000       | 24K       |
+| Extreme  | 3           | 18          | 6              | 3000       | 54K       |
 
 #### Configuration Schema
 
