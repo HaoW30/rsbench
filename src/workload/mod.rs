@@ -2,13 +2,11 @@
 //!
 //! Defines workload abstraction and implementations.
 
-mod oltp;
 mod declarative;
 
 #[cfg(feature = "lua")]
 mod lua;
 
-pub use oltp::OltpReadWrite;
 pub use declarative::DeclarativeWorkload;
 
 #[cfg(feature = "lua")]
@@ -77,6 +75,18 @@ pub struct Operation {
 
     /// Operation type
     pub operation_type: OperationType,
+
+    /// Is this a transaction (multiple SQL statements)
+    #[allow(dead_code)]
+    pub is_transaction: bool,
+
+    /// Transaction SQL statements (if is_transaction is true)
+    #[allow(dead_code)]
+    pub transaction_sqls: Vec<String>,
+
+    /// Transaction parameters (parallel to transaction_sqls)
+    #[allow(dead_code)]
+    pub transaction_params: Vec<Vec<Value>>,
 }
 
 #[derive(Debug, Clone, Copy)]
@@ -99,51 +109,28 @@ impl WorkloadFactory {
 
             // Lua script
             WorkloadConfig::Lua { script } => Self::create_lua(script, seed),
-
-            // Deprecated builtin (warn and fall back to declarative)
-            #[allow(deprecated)]
-            WorkloadConfig::Builtin { name, .. } => {
-                eprintln!("Warning: Builtin workloads are deprecated. Use declarative workloads instead.");
-                eprintln!("         Migrate to: workloads/{}.yaml", name);
-                Self::create_builtin(name, config, seed)
-            }
         }
     }
 
     fn create_declarative(
         file: Option<&std::path::PathBuf>,
         definition: Option<&serde_yaml::Value>,
-        _overrides: Option<&serde_yaml::Value>,
+        overrides: Option<&serde_yaml::Value>,
         seed: u64,
     ) -> Result<Box<dyn Workload>> {
         // Load from file or inline definition
         if let Some(path) = file {
-            Ok(Box::new(DeclarativeWorkload::from_file(path, seed)?))
+            Ok(Box::new(DeclarativeWorkload::from_file_with_overrides(path, overrides, seed)?))
         } else if let Some(def) = definition {
             // Convert serde_yaml::Value to string and parse
             let yaml_str = serde_yaml::to_string(def).map_err(|e| {
                 crate::Error::Workload(format!("Failed to serialize inline definition: {}", e))
             })?;
-            Ok(Box::new(DeclarativeWorkload::from_yaml(&yaml_str, seed)?))
+            Ok(Box::new(DeclarativeWorkload::from_yaml_with_overrides(&yaml_str, overrides, seed)?))
         } else {
             Err(crate::Error::Workload(
                 "Declarative workload must specify either 'file' or 'definition'".into()
             ))
-        }
-    }
-
-    #[allow(deprecated)]
-    fn create_builtin(
-        name: &str,
-        config: &WorkloadConfig,
-        seed: u64,
-    ) -> Result<Box<dyn Workload>> {
-        match name {
-            "oltp_read_write" => Ok(Box::new(OltpReadWrite::new(config, seed)?)),
-            _ => Err(crate::Error::Workload(format!(
-                "Unknown builtin workload: {}",
-                name
-            ))),
         }
     }
 
@@ -204,50 +191,19 @@ mod tests {
             sql: "SELECT * FROM test".to_string(),
             params: vec![Value::Int(42)],
             operation_type: OperationType::Read,
+            is_transaction: false,
+            transaction_sqls: Vec::new(),
+            transaction_params: Vec::new(),
         };
 
         assert_eq!(op.name, "test_op");
         assert_eq!(op.sql, "SELECT * FROM test");
         assert_eq!(op.params.len(), 1);
+        assert!(!op.is_transaction);
 
         match op.operation_type {
             OperationType::Read => {},
             _ => panic!("Expected Read operation type"),
-        }
-    }
-
-    #[test]
-    fn test_workload_factory_builtin_oltp() {
-        let config = WorkloadConfig::Builtin {
-            name: "oltp_read_write".to_string(),
-            table_count: 1,
-            table_size: 100,
-        };
-
-        let result = WorkloadFactory::create(&config, 42);
-        assert!(result.is_ok());
-
-        let workload = result.unwrap();
-        assert_eq!(workload.name(), "oltp_read_write");
-    }
-
-    #[test]
-    fn test_workload_factory_unknown_builtin() {
-        let config = WorkloadConfig::Builtin {
-            name: "unknown_workload".to_string(),
-            table_count: 1,
-            table_size: 100,
-        };
-
-        let result = WorkloadFactory::create(&config, 42);
-        assert!(result.is_err());
-
-        match result {
-            Err(crate::Error::Workload(msg)) => {
-                assert!(msg.contains("Unknown builtin workload"));
-                assert!(msg.contains("unknown_workload"));
-            }
-            _ => panic!("Expected Workload error"),
         }
     }
 

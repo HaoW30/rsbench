@@ -196,25 +196,6 @@ impl ConfigLoader {
                     return Err(Error::Config("Lua script path cannot be empty".into()));
                 }
             }
-            #[allow(deprecated)]
-            WorkloadConfig::Builtin {
-                name,
-                table_count,
-                table_size,
-            } => {
-                eprintln!(
-                    "Warning: Builtin workloads are deprecated. Use declarative workloads instead."
-                );
-                if name.is_empty() {
-                    return Err(Error::Config("Workload name cannot be empty".into()));
-                }
-                if *table_count == 0 {
-                    return Err(Error::Config("Workload table_count must be > 0".into()));
-                }
-                if *table_size == 0 {
-                    return Err(Error::Config("Workload table_size must be > 0".into()));
-                }
-            }
         }
 
         Ok(())
@@ -538,28 +519,6 @@ pub enum WorkloadConfig {
         /// Path to Lua script file
         script: PathBuf,
     },
-
-    /// Built-in OLTP workload (DEPRECATED - use declarative instead)
-    /// This will be removed in a future version
-    /// Migrate to: workloads/oltp_read_write.yaml
-    #[deprecated(
-        since = "0.2.0",
-        note = "Use declarative workloads instead. See workloads/oltp_*.yaml"
-    )]
-    Builtin {
-        name: String, // "oltp_read_write"
-        #[serde(default = "default_table_count")]
-        table_count: usize,
-        #[serde(default = "default_table_size")]
-        table_size: usize,
-    },
-}
-
-fn default_table_count() -> usize {
-    10
-}
-fn default_table_size() -> usize {
-    10000
 }
 
 /// Determinism configuration
@@ -643,8 +602,8 @@ scenario:
     duration: 60s
     max_connections: 10
   workload:
-    type: builtin
-    name: oltp_read_write
+    type: declarative
+    file: workloads/oltp_read_write.yaml
     table_count: 10
     table_size: 10000
 
@@ -694,8 +653,8 @@ scenario:
     duration: 60s
     max_connections: 10
   workload:
-    type: builtin
-    name: oltp_read_write
+    type: declarative
+    file: workloads/oltp_read_write.yaml
 
 output:
   format: text
@@ -982,8 +941,8 @@ scenario:
     duration: 60s
     max_connections: 10
   workload:
-    type: builtin
-    name: oltp_read_write
+    type: declarative
+    file: workloads/oltp_read_write.yaml
 
 output:
   format: text
@@ -1021,8 +980,8 @@ scenario:
     duration: 60s
     max_connections: 10
   workload:
-    type: builtin
-    name: oltp_read_write
+    type: declarative
+    file: workloads/oltp_read_write.yaml
 
 output:
   format: text
@@ -1057,8 +1016,8 @@ scenario:
     duration: 60s
     max_connections: 10
   workload:
-    type: builtin
-    name: oltp_read_write
+    type: declarative
+    file: workloads/oltp_read_write.yaml
 
 output:
   format: text
@@ -1093,8 +1052,8 @@ scenario:
     duration: 60s
     max_connections: 10
   workload:
-    type: builtin
-    name: oltp_read_write
+    type: declarative
+    file: workloads/oltp_read_write.yaml
 
 output:
   format: text
@@ -1129,8 +1088,8 @@ scenario:
     duration: 60s
     max_connections: 10
   workload:
-    type: builtin
-    name: oltp_read_write
+    type: declarative
+    file: workloads/oltp_read_write.yaml
 
 output:
   format: text
@@ -1165,8 +1124,8 @@ scenario:
     duration: 60s
     max_connections: 10
   workload:
-    type: builtin
-    name: oltp_read_write
+    type: declarative
+    file: workloads/oltp_read_write.yaml
 
 output:
   format: text
@@ -1203,8 +1162,8 @@ scenario:
     duration: 60s
     max_connections: 10
   workload:
-    type: builtin
-    name: oltp_read_write
+    type: declarative
+    file: workloads/oltp_read_write.yaml
 
 output:
   format: text
@@ -1239,8 +1198,8 @@ scenario:
     duration: 60s
     max_connections: 10
   workload:
-    type: builtin
-    name: oltp_read_write
+    type: declarative
+    file: workloads/oltp_read_write.yaml
 
 output:
   format: text
@@ -1275,8 +1234,8 @@ scenario:
     duration: 0s
     max_connections: 10
   workload:
-    type: builtin
-    name: oltp_read_write
+    type: declarative
+    file: workloads/oltp_read_write.yaml
 
 output:
   format: text
@@ -1310,8 +1269,8 @@ scenario:
     stages: []
     max_connections: 10
   workload:
-    type: builtin
-    name: oltp_read_write
+    type: declarative
+    file: workloads/oltp_read_write.yaml
 
 output:
   format: text
@@ -1327,7 +1286,7 @@ output:
     }
 
     #[test]
-    fn test_validate_workload_empty_name() {
+    fn test_validate_workload_invalid_declarative() {
         let yaml = r#"
 database:
   driver: mysql
@@ -1346,8 +1305,7 @@ scenario:
     duration: 60s
     max_connections: 10
   workload:
-    type: builtin
-    name: ""
+    type: declarative
 
 output:
   format: text
@@ -1355,11 +1313,14 @@ output:
 
         let config = ConfigLoader::load(ConfigSource::Yaml(yaml.to_string())).unwrap();
         let result = ConfigLoader::validate(&config);
+        // Should fail because declarative workload must specify either file or definition
         assert!(result.is_err());
-        assert!(result
-            .unwrap_err()
-            .to_string()
-            .contains("name cannot be empty"));
+        let err_msg = result.unwrap_err().to_string();
+        assert!(
+            err_msg.contains("'file' or 'definition'") || err_msg.contains("either"),
+            "Expected error about missing file/definition, got: {}",
+            err_msg
+        );
     }
 
     #[test]
@@ -1382,8 +1343,8 @@ scenario:
     duration: 60s
     max_connections: 10
   workload:
-    type: builtin
-    name: oltp_read_write
+    type: declarative
+    file: workloads/oltp_read_write.yaml
 
 output:
   format: text
@@ -1418,8 +1379,8 @@ scenario:
     duration: 60s
     max_connections: 10
   workload:
-    type: builtin
-    name: oltp_read_write
+    type: declarative
+    file: workloads/oltp_read_write.yaml
 
 output:
   format: text
@@ -1459,8 +1420,8 @@ scenario:
     duration: 60s
     max_connections: 10
   workload:
-    type: builtin
-    name: oltp_read_write
+    type: declarative
+    file: workloads/oltp_read_write.yaml
 
 output:
   format: text
@@ -1505,8 +1466,8 @@ scenario:
     duration: 60s
     max_connections: 10
   workload:
-    type: builtin
-    name: oltp_read_write
+    type: declarative
+    file: workloads/oltp_read_write.yaml
 
 output:
   format: text
@@ -1549,8 +1510,8 @@ scenario:
     duration: 60s
     max_connections: 10
   workload:
-    type: builtin
-    name: oltp_read_write
+    type: declarative
+    file: workloads/oltp_read_write.yaml
 
 output:
   format: text
@@ -1595,8 +1556,8 @@ scenario:
     duration: 60s
     max_connections: 10
   workload:
-    type: builtin
-    name: oltp_read_write
+    type: declarative
+    file: workloads/oltp_read_write.yaml
 
 output:
   format: text
@@ -1636,8 +1597,8 @@ scenario:
     duration: 60s
     max_connections: 10
   workload:
-    type: builtin
-    name: oltp_read_write
+    type: declarative
+    file: workloads/oltp_read_write.yaml
 
 output:
   format: text
@@ -1685,8 +1646,8 @@ scenario:
     duration: 60s
     max_connections: 10
   workload:
-    type: builtin
-    name: oltp_read_write
+    type: declarative
+    file: workloads/oltp_read_write.yaml
 
 output:
   format: text

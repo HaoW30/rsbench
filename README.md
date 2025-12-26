@@ -170,29 +170,50 @@ See `workloads/README.md` for the complete guide to creating custom workloads.
 
 RSBench is built around several key components:
 
-- **Scenario Orchestrator**: Time-driven execution with rate control
-- **Dual-Mode Runtime**: Async (primary) and blocking (sysbench compatibility)
+- **Scenario Orchestrator**: Time-driven execution with pluggable executor patterns (open-loop, closed-loop)
+- **Async Runtime**: Efficient tokio-based execution with backpressure monitoring
 - **Connection Pool**: Backpressure-aware with multi-endpoint routing
 - **Declarative Workload Engine**: Transparent YAML workloads with full sysbench compatibility
 - **Lua Workload Engine**: Programmable workloads for complex scenarios
 - **Metrics Engine**: HDR histograms with multiple output formats
-- **Event Integration**: K8s events, webhooks, lifecycle testing
+- **Event Integration**: K8s events, webhooks, lifecycle testing (M1+)
 
 ### Key Architectural Decisions
 
-**Workload vs Scenario Separation:**
+**Executor vs Runtime Separation:**
+- **Executor** = HOW/WHEN to submit operations (open-loop: time-driven, closed-loop: worker-driven)
+- **Runtime** = HOW to execute operations (always async with tokio)
 - **Workload** = WHAT operations to run (SQL generation, data distribution)
-- **Scenario** = HOW/WHEN to run (execution lifecycle, rate control, duration)
 
-This separation allows the same workload to run at different rates, durations, and against different databases.
+This three-layer separation provides maximum flexibility:
+- Same workload can run with different execution patterns (open/closed loop)
+- Same executor can work with different workloads
+- Single async runtime handles all execution modes efficiently
+
+**Worker Model - Async Tasks, Not OS Threads:**
+- **Workers** are lightweight Tokio async tasks (~2KB stack each)
+- 1000 workers can run on 8 OS threads via async I/O multiplexing
+- Sysbench `--threads=100` ≈ RSBench `workers: 100` (semantically equivalent, 40x less memory)
+- Scalable: Simulate 10K+ concurrent users without 10K OS threads
+
+**Executor Patterns:**
+1. **Open-Loop (Rate-Based)**: Time-driven fire-and-forget submission
+   - Constant-rate: Fixed ops/sec (e.g., `rate: 1000`)
+   - Ramping-rate: Staged rate changes (capacity testing)
+   - Use case: Load generation, throughput testing
+
+2. **Closed-Loop (Sysbench-Compatible)**: Worker-driven sequential execution
+   - Fixed worker concurrency (e.g., `workers: 16` = sysbench `--threads=16`)
+   - Natural backpressure (slow queries → lower throughput)
+   - Use case: User concurrency simulation, sysbench replacement
 
 **Declarative-First Design:**
-- All sysbench OLTP tests are now transparent YAML files in `workloads/`
+- All sysbench OLTP tests are transparent YAML files in `workloads/`
 - Full control over schema, operations, data distributions, and parameters
 - No code changes needed to customize workloads
 - Lua scripts available for complex scenarios that need programmability
 
-See the [Architecture Documentation](docs/architecture.md) and [Workload Design](docs/workload-design.md) for details.
+See the [Scenario Design](docs/scenario-design.md), [Workload Design](docs/workload-design.md), and [API Specification](docs/api_spec_m0.md) for details.
 
 ## Roadmap
 
@@ -230,19 +251,23 @@ Monitoring integrations, web interface, and industry-standard benchmark suites
 
 | Feature | Sysbench | RSBench |
 |---------|----------|---------|
-| Load Generation | Thread-based (closed model) | Rate-based (open model) |
-| I/O Model | Blocking | Async + Blocking |
+| Load Generation | Thread-based only | Open-loop (rate-based) + Closed-loop (thread-based) |
+| Thread Model | OS threads | Async tasks (green threads) |
+| Memory (100 threads) | ~800 MB | ~20 MB |
+| I/O Model | Blocking | Async (non-blocking) |
 | Coordinated Omission | Yes (latency skew) | No (accurate) |
-| Backpressure | Hidden | Visible |
+| Backpressure | Hidden | Visible (explicit metric) |
 | Determinism | Limited | Full (seeded RNG) |
-| Multi-Region | No | Yes |
+| Multi-Region | No | Yes (M1+) |
 | Test-as-Code | No | Yes (YAML/TOML) |
-| Lifecycle Testing | No | Yes (K8s events) |
+| Lifecycle Testing | No | Yes (K8s events, M1+) |
 | Workload Definition | Hardcoded Lua | Declarative YAML + Lua |
 | Workload Transparency | Black box | Fully visible/editable |
 | OLTP Tests | Built-in binary | YAML files (user-modifiable) |
 | Custom Workloads | Write Lua | Write YAML (or Lua) |
-| Sysbench Compatibility | N/A | 100% (all parameters exposed) |
+| Sysbench Compatibility | N/A | 100% (command mapping in docs) |
+| `--threads=N` | N OS threads | `workers: N` (N async tasks) |
+| `--rate=X` | Not supported | `rate: X` (open-loop executor) |
 
 ## Contributing
 

@@ -109,25 +109,38 @@ scenario:
 
   # Workload configuration - defines what operations to execute
   workload:
-    # Workload type: "builtin" or "lua"
-    type: builtin
+    # Workload type: "declarative" or "lua"
+    type: declarative
 
-    # --- Builtin Workload Settings ---
+    # --- Declarative Workload Settings ---
 
-    # Builtin workload name
-    # Available: "oltp_read_write"
-    # Future: "oltp_read_only", "oltp_write_only", "oltp_point_select"
-    name: oltp_read_write
+    # Path to workload YAML file
+    # Available workloads in workloads/:
+    #   - oltp_read_write.yaml (balanced read/write)
+    #   - oltp_read_only.yaml (100% reads)
+    #   - oltp_write_only.yaml (100% writes)
+    #   - oltp_point_select.yaml (point selects only)
+    #   - oltp_insert.yaml (inserts only)
+    #   - oltp_update_index.yaml (update indexed column)
+    #   - oltp_update_non_index.yaml (update non-indexed column)
+    #   - oltp_delete.yaml (delete and re-insert)
+    #   - select_random_points.yaml (select 10 random points)
+    #   - select_random_ranges.yaml (select ranges)
+    file: workloads/oltp_read_write.yaml
 
-    # Number of tables to create and use
-    # Default: 10
-    table_count: 10
+    # Optional: Override workload parameters
+    # overrides:
+    #   operations:
+    #     - name: point_select
+    #       weight: 90  # Override to 90% reads
+    #     - name: update_non_index
+    #       weight: 10  # Override to 10% writes
+    #   schema:
+    #     tables:
+    #       - count: 5        # Override table count
+    #         row_count: 1000 # Override row count
 
-    # Number of rows per table
-    # Default: 10000
-    table_size: 10000
-
-    # --- Lua Workload Settings (alternative to builtin) ---
+    # --- Lua Workload Settings (alternative to declarative) ---
     # Uncomment to use custom Lua workload instead:
     # type: lua
     # script: path/to/workload.lua
@@ -200,7 +213,10 @@ output:
 #     rate: 1000
 #     duration: 1h
 #   workload:
-#     type: builtin
-#     name: oltp_read_write
-#     table_count: 100
-#     table_size: 1000000
+#     type: declarative
+#     file: workloads/oltp_read_write.yaml
+#     overrides:
+#       schema:
+#         tables:
+#           - count: 100
+#             row_count: 1000000

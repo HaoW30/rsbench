@@ -71,9 +71,9 @@ rsbench/
 ### Runtime Module
 - **Trait**: `RuntimeEngine` - abstraction for execution engines
 - **Factory**: Creates runtime based on config
-- **Implementations**:
-  - `AsyncRuntime`: Primary mode with backpressure monitoring
-  - `BlockingRuntime`: Sysbench compatibility mode
+- **Implementation**:
+  - `AsyncRuntime`: Tokio-based async execution with backpressure monitoring
+  - **Note**: BlockingRuntime deprecated in favor of closed-loop executor pattern
 
 ### Pool Module
 - Manages database connections
@@ -94,11 +94,16 @@ rsbench/
 - **Outputs**: Text (sysbench-compatible), JSON
 
 ### Scenario Module
-- Orchestrates workload execution
-- Implements executor types:
-  - `ConstantRate`: Fixed ops/sec
-  - `RampingRate`: Staged rate changes
-- Time-driven scheduling via rate limiter
+- Orchestrates workload execution with pluggable executor patterns
+- **Executor Types**:
+  - **Open-Loop Executors** (M0):
+    - `ConstantRate`: Fixed ops/sec, time-driven submission
+    - `RampingRate`: Staged rate changes for capacity testing
+  - **Closed-Loop Executor** (M0/M1):
+    - Worker-driven sequential execution (sysbench `--threads` equivalent)
+    - Natural backpressure modeling
+- **Worker Model**: Tokio async tasks (green threads), not OS threads
+- **Separation of Concerns**: Executor (when/how to submit) vs Runtime (how to execute)
 
 ### CLI Module
 - Command-line argument parsing (clap)
@@ -139,6 +144,38 @@ Shared components use `Arc` for thread-safe access:
 - `MetricsCollector`
 - `RuntimeEngine`
 
+### Executor Pattern (M0 Design Decision)
+
+**Key Insight**: Execution pattern (open-loop vs closed-loop) belongs in the **Scenario** module, not the **Runtime** module.
+
+**Why Executor, Not Runtime Mode?**
+
+| Concern | Wrong Layer (Runtime) | Right Layer (Executor) |
+|---------|----------------------|------------------------|
+| When to submit operations | ❌ | ✅ Executor decides |
+| Fire-and-forget vs await completion | ❌ | ✅ Executor controls |
+| Worker concurrency model | ❌ | ✅ Executor configures |
+| Thread blocking vs async | ✅ Runtime handles | ❌ |
+
+**Benefits of This Design:**
+1. **Single Runtime**: Only `AsyncRuntime` needed (simpler, more efficient)
+2. **Clear Separation**: Executor = submission strategy, Runtime = execution mechanism
+3. **Sysbench Compatibility**: Achieved via closed-loop executor, not separate runtime
+4. **Flexibility**: Can combine patterns (e.g., closed-loop with rate limiting)
+
+**Previous Design (Deprecated):**
+```
+Runtime: { Async, Blocking }  ❌ Wrong abstraction
+```
+
+**Current Design (M0):**
+```
+Executor: { ConstantRate, RampingRate, ClosedLoop }  ✅ Right abstraction
+Runtime: AsyncRuntime (single implementation)
+```
+
+See `docs/scenario-design.md` Section 11.1 for detailed discussion.
+
 ## Feature Flags
 
 ```toml
@@ -173,11 +210,14 @@ cargo build --features full
 ✅ Basic implementations for each module
 ✅ Code compiles successfully
 ✅ Example configuration
+✅ Declarative workload engine (complete)
+✅ Open-loop executors (constant-rate, ramping-rate)
 
 🚧 TODO for full M0 functionality:
+- **Priority: Implement closed-loop executor** (replace BlockingRuntime)
 - Complete workload prepare() implementation
-- Add data loading to OLTP workload
-- Implement proper connection pooling
+- Add data loading to declarative workload
+- Remove BlockingRuntime (deprecated)
 - Add comprehensive error handling
 - Write unit tests
 - Write integration tests

@@ -66,6 +66,9 @@ impl Workload for LuaWorkload {
             sql,
             params: vec![], // M0: basic support only
             operation_type: OperationType::Read, // M0: simplified
+            is_transaction: false,
+            transaction_sqls: Vec::new(),
+            transaction_params: Vec::new(),
         })
     }
 
