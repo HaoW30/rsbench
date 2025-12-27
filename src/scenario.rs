@@ -721,14 +721,46 @@ mod tests {
     }
 
     // Mock runtime for testing
-    struct MockRuntime;
+    // Enhanced MockRuntime with configurable behavior
+    struct MockRuntime {
+        backpressure_enabled: bool,
+        operation_delay: Duration,
+    }
+
+    impl MockRuntime {
+        fn new() -> Self {
+            Self {
+                backpressure_enabled: false,
+                operation_delay: Duration::from_millis(10),
+            }
+        }
+
+        fn with_backpressure() -> Self {
+            Self {
+                backpressure_enabled: true,
+                operation_delay: Duration::from_millis(10),
+            }
+        }
+
+        fn with_delay(delay: Duration) -> Self {
+            Self {
+                backpressure_enabled: false,
+                operation_delay: delay,
+            }
+        }
+    }
 
     #[async_trait::async_trait]
     impl crate::runtime::RuntimeEngine for MockRuntime {
         async fn submit(&self, _op: crate::workload::Operation) -> Result<crate::runtime::OperationResult> {
+            // Simulate operation delay
+            if self.operation_delay.as_millis() > 0 {
+                tokio::time::sleep(self.operation_delay).await;
+            }
+
             Ok(crate::runtime::OperationResult {
                 success: true,
-                duration: Duration::from_millis(10),
+                duration: self.operation_delay,
                 rows_affected: 1,
                 error: None,
             })
@@ -739,7 +771,7 @@ mod tests {
                 active_connections: 0,
                 queued_operations: 0,
                 pool_utilization: 0.0,
-                backpressure_active: false,
+                backpressure_active: self.backpressure_enabled,
             }
         }
 
@@ -768,7 +800,7 @@ mod tests {
         };
 
         let workload = Box::new(MockWorkload);
-        let runtime = Arc::new(MockRuntime);
+        let runtime = Arc::new(MockRuntime::new());
         let metrics = MetricsCollector::new();
 
         let executor = ScenarioExecutor::new(scenario_config, workload, runtime, metrics);
@@ -833,7 +865,7 @@ mod tests {
         };
 
         let workload = Box::new(MockWorkload);
-        let runtime = Arc::new(MockRuntime);
+        let runtime = Arc::new(MockRuntime::new());
         let metrics = MetricsCollector::new();
 
         let executor = ScenarioExecutor::new(scenario_config, workload, runtime, metrics);
@@ -876,7 +908,7 @@ mod tests {
         };
 
         let workload = Box::new(MockWorkload);
-        let runtime = Arc::new(MockRuntime);
+        let runtime = Arc::new(MockRuntime::new());
         let metrics = MetricsCollector::new();
 
         let mut executor = ScenarioExecutor::new(scenario_config, workload, runtime, metrics);
@@ -929,7 +961,7 @@ mod tests {
         };
 
         let workload = Box::new(MockWorkload);
-        let runtime = Arc::new(MockRuntime);
+        let runtime = Arc::new(MockRuntime::new());
         let metrics = MetricsCollector::new();
 
         let mut executor = ScenarioExecutor::new(scenario_config, workload, runtime, metrics);
@@ -965,7 +997,7 @@ mod tests {
         };
 
         let workload = Box::new(MockWorkload);
-        let runtime = Arc::new(MockRuntime);
+        let runtime = Arc::new(MockRuntime::new());
         let metrics = MetricsCollector::new();
 
         // Record some operations to have data in the snapshot
@@ -1011,7 +1043,7 @@ mod tests {
         };
 
         let workload = Box::new(MockWorkload);
-        let runtime = Arc::new(MockRuntime);
+        let runtime = Arc::new(MockRuntime::new());
         let metrics = MetricsCollector::new();
 
         let mut executor = ScenarioExecutor::new(scenario_config, workload, runtime, metrics);
@@ -1069,7 +1101,7 @@ operations:
         };
 
         let workload = Box::new(MockWorkload);
-        let runtime = Arc::new(MockRuntime);
+        let runtime = Arc::new(MockRuntime::new());
         let metrics = MetricsCollector::new();
 
         let mut executor = ScenarioExecutor::new(scenario_config, workload, runtime, metrics);
@@ -1126,7 +1158,7 @@ operations:
         };
 
         let workload = Box::new(MockWorkload);
-        let runtime = Arc::new(MockRuntime);
+        let runtime = Arc::new(MockRuntime::new());
         let metrics = MetricsCollector::new();
 
         let mut executor = ScenarioExecutor::new(scenario_config, workload, runtime, metrics);
@@ -1155,7 +1187,7 @@ operations:
         };
 
         let workload = Box::new(MockWorkload);
-        let runtime = Arc::new(MockRuntime);
+        let runtime = Arc::new(MockRuntime::new());
         let metrics = MetricsCollector::new();
 
         let mut executor = ScenarioExecutor::new(scenario_config, workload, runtime, metrics);
@@ -1196,7 +1228,7 @@ operations:
         };
 
         let workload = Box::new(MockWorkload);
-        let runtime = Arc::new(MockRuntime);
+        let runtime = Arc::new(MockRuntime::new());
         let metrics = MetricsCollector::new();
 
         let mut executor = ScenarioExecutor::new(scenario_config, workload, runtime, metrics);
@@ -1253,7 +1285,7 @@ operations:
         };
 
         let workload = Box::new(MockWorkload);
-        let runtime = Arc::new(MockRuntime);
+        let runtime = Arc::new(MockRuntime::new());
         let metrics = MetricsCollector::new();
 
         let mut executor = ScenarioExecutor::new(scenario_config, workload, runtime, metrics);
@@ -1265,6 +1297,344 @@ operations:
         let result = result.unwrap();
 
         // Should have completed in approximately the specified duration
+        assert!(result.duration.as_millis() >= 40);
+    }
+
+    // ===== Error Propagation Tests =====
+
+    #[tokio::test]
+    async fn test_error_propagation_from_workload() {
+        use crate::metrics::MetricsCollector;
+
+        // Create a workload that fails
+        struct FailingWorkload;
+        impl crate::workload::Workload for FailingWorkload {
+            fn prepare(&mut self, _ctx: &mut crate::workload::PrepareContext) -> Result<()> {
+                Ok(())
+            }
+
+            fn next_operation(
+                &mut self,
+                _ctx: &crate::workload::ExecutionContext,
+            ) -> Result<crate::workload::Operation> {
+                Err(crate::Error::Workload("Simulated workload error".to_string()))
+            }
+
+            fn cleanup(&mut self) -> Result<()> {
+                Ok(())
+            }
+
+            fn name(&self) -> &str {
+                "failing"
+            }
+        }
+
+        let scenario_config = ScenarioConfig {
+            executor: ExecutorConfig::ConstantRate {
+                rate: 100,
+                duration: Duration::from_millis(50),
+                max_connections: 10,
+            },
+            workload: crate::config::WorkloadConfig::Declarative {
+                file: None,
+                definition: None,
+                overrides: None,
+            },
+        };
+
+        let workload = Box::new(FailingWorkload);
+        let runtime = Arc::new(MockRuntime::new());
+        let metrics = MetricsCollector::new();
+
+        let mut executor = ScenarioExecutor::new(scenario_config, workload, runtime, metrics);
+
+        // Execute - workload errors propagate to the caller
+        let result = executor.execute().await;
+
+        // Error should propagate up from workload
+        assert!(result.is_err());
+        assert!(result
+            .unwrap_err()
+            .to_string()
+            .contains("Simulated workload error"));
+    }
+
+    #[tokio::test]
+    async fn test_error_propagation_from_runtime() {
+        use crate::metrics::MetricsCollector;
+
+        // Create a runtime that fails
+        struct FailingRuntime;
+
+        #[async_trait::async_trait]
+        impl crate::runtime::RuntimeEngine for FailingRuntime {
+            async fn submit(
+                &self,
+                _op: crate::workload::Operation,
+            ) -> Result<crate::runtime::OperationResult> {
+                Err(crate::Error::Database(crate::DatabaseError::Query(
+                    "Simulated runtime error".to_string(),
+                )))
+            }
+
+            fn stats(&self) -> crate::runtime::RuntimeStats {
+                crate::runtime::RuntimeStats {
+                    active_connections: 0,
+                    queued_operations: 0,
+                    pool_utilization: 0.0,
+                    backpressure_active: false,
+                }
+            }
+
+            async fn shutdown(&mut self) -> Result<()> {
+                Ok(())
+            }
+        }
+
+        let scenario_config = ScenarioConfig {
+            executor: ExecutorConfig::ConstantRate {
+                rate: 100,
+                duration: Duration::from_millis(50),
+                max_connections: 10,
+            },
+            workload: crate::config::WorkloadConfig::Declarative {
+                file: None,
+                definition: None,
+                overrides: None,
+            },
+        };
+
+        let workload = Box::new(MockWorkload);
+        let runtime = Arc::new(FailingRuntime);
+        let metrics = MetricsCollector::new();
+
+        let mut executor = ScenarioExecutor::new(scenario_config, workload, runtime, metrics);
+
+        // Execute - runtime errors are logged but don't stop execution
+        let result = executor.execute().await;
+
+        // Should complete even with runtime errors (fire-and-forget in open-loop)
+        assert!(result.is_ok());
+    }
+
+    // ===== Boundary Condition Tests =====
+
+    #[tokio::test]
+    async fn test_zero_duration_constant_rate() {
+        use crate::metrics::MetricsCollector;
+
+        let scenario_config = ScenarioConfig {
+            executor: ExecutorConfig::ConstantRate {
+                rate: 100,
+                duration: Duration::from_millis(0), // Zero duration
+                max_connections: 10,
+            },
+            workload: crate::config::WorkloadConfig::Declarative {
+                file: None,
+                definition: None,
+                overrides: None,
+            },
+        };
+
+        let workload = Box::new(MockWorkload);
+        let runtime = Arc::new(MockRuntime::new());
+        let metrics = MetricsCollector::new();
+
+        let mut executor = ScenarioExecutor::new(scenario_config, workload, runtime, metrics);
+
+        let result = executor.execute().await;
+        assert!(result.is_ok());
+
+        let result = result.unwrap();
+        // Should complete immediately with zero or very few operations
+        assert!(result.operations_completed <= 1);
+    }
+
+    #[tokio::test]
+    async fn test_very_short_duration() {
+        use crate::metrics::MetricsCollector;
+
+        let scenario_config = ScenarioConfig {
+            executor: ExecutorConfig::ConstantRate {
+                rate: 1000,
+                duration: Duration::from_millis(1), // 1ms duration
+                max_connections: 10,
+            },
+            workload: crate::config::WorkloadConfig::Declarative {
+                file: None,
+                definition: None,
+                overrides: None,
+            },
+        };
+
+        let workload = Box::new(MockWorkload);
+        let runtime = Arc::new(MockRuntime::new());
+        let metrics = MetricsCollector::new();
+
+        let mut executor = ScenarioExecutor::new(scenario_config, workload, runtime, metrics);
+
+        let result = executor.execute().await;
+        assert!(result.is_ok());
+
+        // Should handle very short durations gracefully
+        let result = result.unwrap();
+        // Account for 100ms sleep at end of executor
+        assert!(result.duration.as_millis() <= 150);
+    }
+
+    #[tokio::test]
+    async fn test_very_high_rate() {
+        use crate::metrics::MetricsCollector;
+
+        let scenario_config = ScenarioConfig {
+            executor: ExecutorConfig::ConstantRate {
+                rate: 1_000_000, // 1M ops/sec (very high)
+                duration: Duration::from_millis(10),
+                max_connections: 10,
+            },
+            workload: crate::config::WorkloadConfig::Declarative {
+                file: None,
+                definition: None,
+                overrides: None,
+            },
+        };
+
+        let workload = Box::new(MockWorkload);
+        let runtime = Arc::new(MockRuntime::new());
+        let metrics = MetricsCollector::new();
+
+        let mut executor = ScenarioExecutor::new(scenario_config, workload, runtime, metrics);
+
+        let result = executor.execute().await;
+        assert!(result.is_ok());
+
+        // Should handle high rates without panicking
+        // (actual rate limited by system capabilities)
+    }
+
+    #[test]
+    fn test_empty_ramping_stages() {
+        use crate::metrics::MetricsCollector;
+
+        let scenario_config = ScenarioConfig {
+            executor: ExecutorConfig::RampingRate {
+                stages: vec![], // Empty stages
+                prealloc_connections: 5,
+                max_connections: 10,
+            },
+            workload: crate::config::WorkloadConfig::Declarative {
+                file: None,
+                definition: None,
+                overrides: None,
+            },
+        };
+
+        let workload = Box::new(MockWorkload);
+        let runtime = Arc::new(MockRuntime::new());
+        let metrics = MetricsCollector::new();
+
+        // Constructor should handle empty stages gracefully
+        let executor = ScenarioExecutor::new(scenario_config, workload, runtime, metrics);
+
+        // Should succeed (uses default rate of 100)
+        assert_eq!(executor.rate_limiter.current_rate(), 100);
+    }
+
+    #[tokio::test]
+    async fn test_single_stage_ramping() {
+        use crate::metrics::MetricsCollector;
+
+        let scenario_config = ScenarioConfig {
+            executor: ExecutorConfig::RampingRate {
+                stages: vec![RateStage {
+                    target_rate: 200,
+                    duration: Duration::from_millis(50),
+                }],
+                prealloc_connections: 5,
+                max_connections: 10,
+            },
+            workload: crate::config::WorkloadConfig::Declarative {
+                file: None,
+                definition: None,
+                overrides: None,
+            },
+        };
+
+        let workload = Box::new(MockWorkload);
+        let runtime = Arc::new(MockRuntime::new());
+        let metrics = MetricsCollector::new();
+
+        let mut executor = ScenarioExecutor::new(scenario_config, workload, runtime, metrics);
+
+        let result = executor.execute().await;
+        assert!(result.is_ok());
+
+        // Should handle single stage correctly
+        let result = result.unwrap();
+        assert!(result.duration.as_millis() >= 40);
+    }
+
+    #[tokio::test]
+    async fn test_closed_loop_zero_workers() {
+        use crate::metrics::MetricsCollector;
+
+        let scenario_config = ScenarioConfig {
+            executor: ExecutorConfig::ClosedLoop {
+                workers: 0, // Zero workers
+                duration: Duration::from_millis(50),
+                think_time: None,
+                max_connections: 10,
+            },
+            workload: crate::config::WorkloadConfig::Declarative {
+                file: None,
+                definition: None,
+                overrides: None,
+            },
+        };
+
+        let workload = Box::new(MockWorkload);
+        let runtime = Arc::new(MockRuntime::new());
+        let metrics = MetricsCollector::new();
+
+        let mut executor = ScenarioExecutor::new(scenario_config, workload, runtime, metrics);
+
+        let result = executor.execute().await;
+        assert!(result.is_ok());
+
+        let result = result.unwrap();
+        // Should complete with zero operations
+        assert_eq!(result.operations_completed, 0);
+    }
+
+    #[tokio::test]
+    async fn test_closed_loop_single_worker() {
+        use crate::metrics::MetricsCollector;
+
+        let scenario_config = ScenarioConfig {
+            executor: ExecutorConfig::ClosedLoop {
+                workers: 1, // Single worker
+                duration: Duration::from_millis(50),
+                think_time: None,
+                max_connections: 10,
+            },
+            workload: crate::config::WorkloadConfig::Declarative {
+                file: None,
+                definition: None,
+                overrides: None,
+            },
+        };
+
+        let workload = Box::new(MockWorkload);
+        let runtime = Arc::new(MockRuntime::new());
+        let metrics = MetricsCollector::new();
+
+        let mut executor = ScenarioExecutor::new(scenario_config, workload, runtime, metrics);
+
+        let result = executor.execute().await;
+        assert!(result.is_ok());
+
+        // Should work with single worker
+        let result = result.unwrap();
         assert!(result.duration.as_millis() >= 40);
     }
 }
