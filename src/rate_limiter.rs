@@ -231,6 +231,87 @@ impl RateLimiter {
         }
     }
 
+    /// Acquire N permits in batch (more efficient than N × acquire)
+    ///
+    /// Acquires multiple permits atomically. More efficient than calling `acquire()`
+    /// N times because it only does the refill/consumption logic once.
+    ///
+    /// # Arguments
+    ///
+    /// * `n` - Number of permits to acquire (must be > 0)
+    ///
+    /// # Returns
+    ///
+    /// Batch of N permits
+    ///
+    /// # Panics
+    ///
+    /// Panics if `n` is 0.
+    ///
+    /// # Examples
+    ///
+    /// ```no_run
+    /// use rsbench::rate_limiter::RateLimiter;
+    ///
+    /// # async fn example() {
+    /// let limiter = RateLimiter::new(1000);
+    /// let permits = limiter.acquire_many(100).await;
+    /// for _ in 0..100 {
+    ///     // Submit operation...
+    /// }
+    /// # }
+    /// ```
+    pub async fn acquire_many(&self, n: u64) -> Permits {
+        assert!(n > 0, "Must acquire at least 1 permit");
+
+        let rate_nanos = self.rate_nanos.load(Ordering::Relaxed);
+        let required_nanos = n * rate_nanos;
+
+        loop {
+            // 1. Get current time and calculate elapsed
+            let now = nanos_since_epoch();
+            let last = self.last_update.load(Ordering::Relaxed);
+            let elapsed = now.saturating_sub(last);
+
+            // 2. Add elapsed time as tokens (1 atomic op)
+            let prev_tokens = self.tokens_nanos.fetch_add(
+                elapsed as i64,
+                Ordering::AcqRel,
+            );
+
+            // 3. Calculate current tokens with soft capacity limit
+            let capacity = self.capacity_nanos.load(Ordering::Relaxed);
+            let current_tokens = (prev_tokens + elapsed as i64).min(capacity as i64);
+
+            // 4. Update timestamp (weak CAS, tolerate failure)
+            self.last_update
+                .compare_exchange_weak(
+                    last,
+                    now,
+                    Ordering::Release,
+                    Ordering::Relaxed,
+                )
+                .ok();
+
+            // 5. Try to consume N tokens (1 atomic op)
+            if current_tokens >= required_nanos as i64 {
+                let consumed = self.tokens_nanos.fetch_sub(
+                    required_nanos as i64,
+                    Ordering::AcqRel,
+                );
+
+                if consumed >= required_nanos as i64 {
+                    return Permits { count: n };
+                }
+                // Lost race, retry
+            } else {
+                // 6. Not enough tokens - sleep exact deficit
+                let deficit = (required_nanos as i64 - current_tokens).max(0) as u64;
+                tokio::time::sleep(Duration::from_nanos(deficit)).await;
+            }
+        }
+    }
+
     /// Change rate dynamically (for ramping scenarios)
     ///
     /// Updates the rate atomically. The new rate takes effect immediately.
@@ -318,6 +399,36 @@ impl RateLimiter {
 /// Represents permission to submit one operation. The permit is zero-sized,
 /// so there's no runtime cost to creating or passing it around.
 pub struct Permit;
+
+/// Batch of permits
+///
+/// Represents permission to submit N operations. Returned by `acquire_many()`.
+///
+/// # Examples
+///
+/// ```no_run
+/// use rsbench::rate_limiter::RateLimiter;
+///
+/// # async fn example() {
+/// let limiter = RateLimiter::new(1000);
+/// let permits = limiter.acquire_many(100).await;
+/// println!("Acquired {} permits", permits.count());
+/// # }
+/// ```
+pub struct Permits {
+    count: u64,
+}
+
+impl Permits {
+    /// Get the number of permits in this batch
+    ///
+    /// # Returns
+    ///
+    /// Number of permits
+    pub fn count(&self) -> u64 {
+        self.count
+    }
+}
 
 /// Helper function to get current time in nanoseconds since epoch
 fn nanos_since_epoch() -> u64 {
@@ -445,6 +556,84 @@ mod tests {
         for handle in handles {
             handle.await.unwrap();
         }
+    }
+
+    #[tokio::test]
+    async fn test_acquire_many_basic() {
+        let limiter = RateLimiter::new(1000);
+
+        let initial = limiter.available_permits();
+        let permits = limiter.acquire_many(10).await;
+
+        assert_eq!(permits.count(), 10);
+
+        // Should have consumed at least 10 permits
+        let remaining = limiter.available_permits();
+        assert!(remaining <= initial);
+    }
+
+    #[tokio::test]
+    async fn test_acquire_many_respects_rate() {
+        let limiter = RateLimiter::new(1000); // 1K ops/sec
+
+        // Exhaust burst capacity
+        for _ in 0..2000 {
+            limiter.acquire().await;
+        }
+
+        // Now measure batch acquisition
+        let start = Instant::now();
+        limiter.acquire_many(100).await;
+        let elapsed = start.elapsed();
+
+        // Should take ~100ms (100 ops at 1K ops/sec)
+        // Allow wide tolerance
+        assert!(elapsed.as_millis() >= 50); // -50%
+        assert!(elapsed.as_millis() <= 200); // +100%
+    }
+
+    #[test]
+    #[should_panic(expected = "Must acquire at least 1 permit")]
+    fn test_acquire_many_zero_panics() {
+        let rt = tokio::runtime::Runtime::new().unwrap();
+        let limiter = RateLimiter::new(1000);
+        rt.block_on(async {
+            limiter.acquire_many(0).await;
+        });
+    }
+
+    #[tokio::test]
+    async fn test_stress_concurrent_mixed() {
+        // Stress test: Mix of single and batch acquisitions
+        let limiter = Arc::new(RateLimiter::new(50_000));
+        let mut handles = vec![];
+
+        // 50 tasks doing single acquire
+        for _ in 0..50 {
+            let lim = limiter.clone();
+            handles.push(tokio::spawn(async move {
+                for _ in 0..100 {
+                    lim.acquire().await;
+                }
+            }));
+        }
+
+        // 50 tasks doing batch acquire
+        for _ in 0..50 {
+            let lim = limiter.clone();
+            handles.push(tokio::spawn(async move {
+                for _ in 0..10 {
+                    lim.acquire_many(10).await;
+                }
+            }));
+        }
+
+        // All tasks should complete without deadlock
+        for handle in handles {
+            handle.await.unwrap();
+        }
+
+        // Total: 50*100 + 50*10*10 = 5000 + 5000 = 10,000 permits acquired
     }
 
     #[test]
