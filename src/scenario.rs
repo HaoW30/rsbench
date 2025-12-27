@@ -90,7 +90,6 @@ impl ScenarioExecutor {
     }
 
     /// Handle incoming events (non-blocking)
-    /// Returns true if should continue execution, false if should stop
     async fn handle_events(&mut self) -> Result<()> {
         if let Some(ref mut rx) = self.event_rx {
             // Try to receive events without blocking
@@ -98,25 +97,46 @@ impl ScenarioExecutor {
                 match event {
                     Event::RateChange(new_rate) => {
                         self.rate_limiter.set_rate(new_rate);
+                        tracing::info!("Rate changed to {} ops/sec", new_rate);
                     }
                     Event::PhaseTransition(phase) => match phase {
                         Phase::Pause => {
                             self.paused = true;
+                            tracing::info!("Scenario paused");
                         }
                         Phase::Resume => {
                             self.paused = false;
+                            tracing::info!("Scenario resumed");
                         }
                         Phase::Shutdown => {
                             self.shutdown_requested = true;
+                            tracing::info!("Graceful shutdown requested");
                         }
                     },
                     Event::MetricsSnapshot => {
-                        // TODO: M1 - Take intermediate snapshot
-                        // For now, this is a no-op
+                        // Take intermediate snapshot and log summary
+                        let snapshot = self.metrics.snapshot();
+                        let total_ops: u64 = snapshot
+                            .operation_metrics
+                            .values()
+                            .map(|m| m.count)
+                            .sum();
+                        let total_errors: u64 = snapshot
+                            .operation_metrics
+                            .values()
+                            .map(|m| m.errors)
+                            .sum();
+                        tracing::info!(
+                            "Intermediate metrics snapshot: {} operations, {} errors, {} backpressure events, elapsed={:?}",
+                            total_ops,
+                            total_errors,
+                            snapshot.backpressure_events,
+                            snapshot.duration
+                        );
                     }
-                    Event::Custom(_) => {
-                        // TODO: M1 - Handle custom events
-                        // For now, this is a no-op
+                    Event::Custom(data) => {
+                        tracing::debug!("Custom event received: {:?}", data);
+                        // TODO: M1 - Handle custom events based on application logic
                     }
                 }
             }
@@ -126,21 +146,44 @@ impl ScenarioExecutor {
 
     /// Execute scenario
     pub async fn execute(&mut self) -> Result<ScenarioResult> {
-        // TODO: Prepare workload
-        // let prepare_ctx = PrepareContext { ... };
-        // self.workload.prepare(&prepare_ctx)?;
+        tracing::info!("Starting scenario execution");
+
+        // TODO M1: Call workload.prepare() to create tables and load data
+        // This requires adding ConnectionPool to ScenarioExecutor constructor
+        // and implementing PrepareDatabase adapter. For M0, tables must be
+        // created manually before running benchmarks.
+        // Reference: src/workload/mod.rs PrepareContext
 
         // Execute based on executor type
         let executor = self.config.executor.clone();
-        match executor {
+        let result = match executor {
             ExecutorConfig::ConstantRate {
                 rate, duration, ..
-            } => self.execute_constant_rate(rate, duration).await,
-            ExecutorConfig::RampingRate { stages, .. } => self.execute_ramping_rate(&stages).await,
+            } => {
+                tracing::info!("Executing constant-rate scenario: rate={}/s, duration={:?}", rate, duration);
+                self.execute_constant_rate(rate, duration).await?
+            }
+            ExecutorConfig::RampingRate { stages, .. } => {
+                let total_duration: Duration = stages.iter().map(|s| s.duration).sum();
+                tracing::info!("Executing ramping-rate scenario: {} stages, total duration={:?}", stages.len(), total_duration);
+                self.execute_ramping_rate(&stages).await?
+            }
             ExecutorConfig::ClosedLoop {
                 workers, duration, ..
-            } => self.execute_closed_loop(workers, duration).await,
-        }
+            } => {
+                tracing::info!("Executing closed-loop scenario: {} workers, duration={:?}", workers, duration);
+                self.execute_closed_loop(workers, duration).await?
+            }
+        };
+
+        tracing::info!(
+            "Scenario execution completed: {} operations in {:?}, success_rate={:.2}%",
+            result.operations_completed,
+            result.duration,
+            result.success_rate() * 100.0
+        );
+
+        Ok(result)
     }
 
     async fn execute_constant_rate(&mut self, rate: u64, duration: Duration) -> Result<ScenarioResult> {
@@ -904,6 +947,88 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn test_handle_events_metrics_snapshot() {
+        use crate::metrics::MetricsCollector;
+        use crate::driver::QueryResult;
+
+        let scenario_config = ScenarioConfig {
+            executor: ExecutorConfig::ConstantRate {
+                rate: 100,
+                duration: Duration::from_secs(10),
+                max_connections: 10,
+            },
+            workload: crate::config::WorkloadConfig::Declarative {
+                file: None,
+                definition: None,
+                overrides: None,
+            },
+        };
+
+        let workload = Box::new(MockWorkload);
+        let runtime = Arc::new(MockRuntime);
+        let metrics = MetricsCollector::new();
+
+        // Record some operations to have data in the snapshot
+        metrics.record_operation(
+            "test_op",
+            Duration::from_millis(10),
+            &Ok(QueryResult {
+                rows_affected: 1,
+                last_insert_id: None,
+            }),
+        );
+        metrics.record_backpressure_event();
+
+        let mut executor = ScenarioExecutor::new(scenario_config, workload, runtime, metrics);
+
+        // Create event channel
+        let (tx, rx) = mpsc::channel(10);
+        executor.attach_event_stream(rx);
+
+        // Send metrics snapshot event
+        tx.send(Event::MetricsSnapshot).await.unwrap();
+        executor.handle_events().await.unwrap();
+
+        // Event should be processed without errors
+        // The snapshot is logged (verified by tracing in handle_events)
+    }
+
+    #[tokio::test]
+    async fn test_handle_events_custom_event() {
+        use crate::metrics::MetricsCollector;
+
+        let scenario_config = ScenarioConfig {
+            executor: ExecutorConfig::ConstantRate {
+                rate: 100,
+                duration: Duration::from_secs(10),
+                max_connections: 10,
+            },
+            workload: crate::config::WorkloadConfig::Declarative {
+                file: None,
+                definition: None,
+                overrides: None,
+            },
+        };
+
+        let workload = Box::new(MockWorkload);
+        let runtime = Arc::new(MockRuntime);
+        let metrics = MetricsCollector::new();
+
+        let mut executor = ScenarioExecutor::new(scenario_config, workload, runtime, metrics);
+
+        // Create event channel
+        let (tx, rx) = mpsc::channel(10);
+        executor.attach_event_stream(rx);
+
+        // Send custom event
+        let custom_data = serde_json::json!({"action": "test", "value": 42});
+        tx.send(Event::Custom(custom_data)).await.unwrap();
+        executor.handle_events().await.unwrap();
+
+        // Event should be processed without errors (logged at debug level)
+    }
+
+    #[tokio::test]
     async fn test_closed_loop_basic() {
         use crate::metrics::MetricsCollector;
 
@@ -1011,5 +1136,135 @@ operations:
 
         // Should complete without errors
         assert!(result.is_ok());
+    }
+
+    #[tokio::test]
+    async fn test_execute_constant_rate_dispatcher() {
+        // Test that execute() correctly dispatches to execute_constant_rate()
+        let scenario_config = ScenarioConfig {
+            executor: ExecutorConfig::ConstantRate {
+                rate: 100,
+                duration: Duration::from_millis(50),
+                max_connections: 10,
+            },
+            workload: crate::config::WorkloadConfig::Declarative {
+                file: None,
+                definition: None,
+                overrides: None,
+            },
+        };
+
+        let workload = Box::new(MockWorkload);
+        let runtime = Arc::new(MockRuntime);
+        let metrics = MetricsCollector::new();
+
+        let mut executor = ScenarioExecutor::new(scenario_config, workload, runtime, metrics);
+
+        // Execute via main entry point
+        let result = executor.execute().await;
+
+        assert!(result.is_ok());
+        let result = result.unwrap();
+
+        // Should have completed some operations
+        assert!(result.duration.as_millis() >= 40);
+    }
+
+    #[tokio::test]
+    async fn test_execute_ramping_rate_dispatcher() {
+        // Test that execute() correctly dispatches to execute_ramping_rate()
+        let scenario_config = ScenarioConfig {
+            executor: ExecutorConfig::RampingRate {
+                stages: vec![
+                    RateStage {
+                        target_rate: 50,
+                        duration: Duration::from_millis(30),
+                    },
+                    RateStage {
+                        target_rate: 100,
+                        duration: Duration::from_millis(30),
+                    },
+                ],
+                prealloc_connections: 5,
+                max_connections: 10,
+            },
+            workload: crate::config::WorkloadConfig::Declarative {
+                file: None,
+                definition: None,
+                overrides: None,
+            },
+        };
+
+        let workload = Box::new(MockWorkload);
+        let runtime = Arc::new(MockRuntime);
+        let metrics = MetricsCollector::new();
+
+        let mut executor = ScenarioExecutor::new(scenario_config, workload, runtime, metrics);
+
+        // Execute via main entry point
+        let result = executor.execute().await;
+
+        assert!(result.is_ok());
+        let result = result.unwrap();
+
+        // Should have run for approximately 60ms total
+        assert!(result.duration.as_millis() >= 50);
+    }
+
+    #[tokio::test]
+    async fn test_execute_closed_loop_dispatcher() {
+        // Test that execute() correctly dispatches to execute_closed_loop()
+        let workload_def = serde_yaml::from_str(
+            r#"
+name: test_workload
+schema:
+  tables:
+    - name: test_table
+      count: 1
+      columns:
+        - name: id
+          type: integer
+          primary_key: true
+operations:
+  - name: select
+    sql: "SELECT * FROM test_table WHERE id = ?"
+    params:
+      - type: integer
+        distribution: uniform
+        min: 1
+        max: 100
+    weight: 100
+"#,
+        )
+        .unwrap();
+
+        let scenario_config = ScenarioConfig {
+            executor: ExecutorConfig::ClosedLoop {
+                workers: 2,
+                duration: Duration::from_millis(50),
+                think_time: None,
+                max_connections: 10,
+            },
+            workload: crate::config::WorkloadConfig::Declarative {
+                file: None,
+                definition: Some(workload_def),
+                overrides: None,
+            },
+        };
+
+        let workload = Box::new(MockWorkload);
+        let runtime = Arc::new(MockRuntime);
+        let metrics = MetricsCollector::new();
+
+        let mut executor = ScenarioExecutor::new(scenario_config, workload, runtime, metrics);
+
+        // Execute via main entry point
+        let result = executor.execute().await;
+
+        assert!(result.is_ok());
+        let result = result.unwrap();
+
+        // Should have completed in approximately the specified duration
+        assert!(result.duration.as_millis() >= 40);
     }
 }
