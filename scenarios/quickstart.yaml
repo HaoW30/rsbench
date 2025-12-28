@@ -1,0 +1,36 @@
+# Quickstart Scenario - Simple Getting Started Example
+#
+# This is the simplest RSBench scenario to get you started quickly.
+# It runs a balanced read/write workload at a modest rate for a short duration.
+#
+# Usage:
+#   rsbench --config config/rsbench.config.yaml --scenario scenarios/quickstart.yaml
+#
+# What this does:
+#   - Runs at 100 operations per second (gentle load)
+#   - For 10 seconds (quick test)
+#   - Uses the standard OLTP read/write workload (60% reads, 40% writes)
+#
+# Next steps after this works:
+#   - Increase rate for load testing: see scenarios/high_throughput.yaml
+#   - Run capacity test: see scenarios/capacity_test.yaml
+#   - Customize workload: see workloads/README.md
+
+scenario:
+  executor:
+    type: constant-rate
+    rate: 100              # 100 operations per second
+    duration: 10s          # Run for 10 seconds
+    max_connections: 10    # Pool size
+
+  workload:
+    type: declarative
+    file: workloads/oltp_read_write.yaml  # Standard balanced workload
+    overrides:
+      schema:
+        tables:
+          - count: 1       # Single table for simplicity
+            row_count: 1000  # Small dataset
+
+determinism:
+  seed: 42  # Same seed = same operation sequence (reproducible)

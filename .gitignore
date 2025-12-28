@@ -11,6 +11,7 @@ rsbench_mld.txt
 # IDE / Editor
 .vscode/
 .idea/
+.claude/
 *.swp
 *.swo
 *~
@@ -27,5 +28,3 @@ criterion/
 results/
 *.json
 *.csv
-!examples/*.json
-!examples/*.yaml

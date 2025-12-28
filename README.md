@@ -60,44 +60,81 @@ cd rsbench
 cargo build --release
 ```
 
-### Quick Start
+### Quick Start (5 Minutes)
 
-RSBench separates infrastructure configuration from test scenarios:
+**Understanding RSBench:** A benchmark = **config** (where) + **scenario** (how/when) + **workload** (what)
 
-**1. Configure your database connection once:**
+- **config/** - Infrastructure setup (database connection, pool settings)
+- **scenarios/** - Test execution (rate, duration, which workload to run)
+- **workloads/** - What operations to perform (SQL queries, parameters, distributions)
+
+**Step 1: Setup your database**
 
 ```bash
-# Edit the default config for your database
-vim config/rsbench.config.yaml
+# Example with MySQL
+mysql -u root -e "CREATE DATABASE sbtest;"
 ```
 
-**2. Run test scenarios:**
+**Step 2: Configure database connection**
 
 ```bash
-# Quick smoke test
+# Edit config to point to your database
+vim config/rsbench.config.yaml
+
+# Or use default (mysql://localhost/sbtest)
+```
+
+**Step 3: Run your first benchmark**
+
+```bash
+# Quickstart: Simple 10-second test at 100 ops/sec
+./target/release/rsbench \
+  --config config/rsbench.config.yaml \
+  --scenario scenarios/quickstart.yaml
+
+# What just happened:
+# - Used config: mysql://localhost/sbtest (from config file)
+# - Used scenario: 100 ops/sec for 10 seconds (from quickstart.yaml)
+# - Used workload: oltp_read_write (referenced in scenario)
+```
+
+**Step 4: Try other scenarios**
+
+```bash
+# Smoke test (very quick validation)
 ./target/release/rsbench --scenario scenarios/smoke_test.yaml
 
-# OLTP read/write test
+# OLTP read/write test (standard benchmark)
 ./target/release/rsbench --scenario scenarios/oltp_read_write.yaml
 
-# Capacity test (finds limits)
+# High throughput test (find max rate)
+./target/release/rsbench --scenario scenarios/high_throughput.yaml
+
+# Capacity test (ramping load to find limits)
 ./target/release/rsbench --scenario scenarios/capacity_test.yaml
 ```
 
-**3. Test against different environments:**
+**Step 5: Test different environments**
 
 ```bash
-# Development (default)
-rsbench --scenario scenarios/oltp_read_write.yaml
+# Development (default config)
+rsbench --scenario scenarios/quickstart.yaml
 
-# Staging
-rsbench --config config/rsbench.config.staging.yaml --scenario scenarios/oltp_read_write.yaml
+# Staging environment
+rsbench --config config/rsbench.config.staging.yaml \
+        --scenario scenarios/oltp_read_write.yaml
 
-# Production (read replica, conservative)
-rsbench --config config/rsbench.config.prod.yaml --scenario scenarios/smoke_test.yaml
+# Production (read replica, conservative rates)
+rsbench --config config/rsbench.config.prod.yaml \
+        --scenario scenarios/smoke_test.yaml
 ```
 
-See `config/README.md` and `scenarios/README.md` for detailed documentation.
+### Next Steps
+
+- **Customize workloads**: See `workloads/README.md` for creating custom operations
+- **Create scenarios**: See `scenarios/README.md` for different execution patterns
+- **Configure infrastructure**: See `config/README.md` for connection settings
+- **Advanced features**: See `docs/` for distributed testing, event integration, etc.
 
 ### Customizing Workloads
 
