@@ -13,6 +13,7 @@ use tokio::sync::Semaphore;
 pub struct AsyncRuntime {
     pool: Arc<ConnectionPool>,
     semaphore: Arc<Semaphore>,
+    max_connections: usize,
     backpressure_monitor: BackpressureMonitor,
     metrics: Arc<MetricsCollector>,
 }
@@ -27,6 +28,7 @@ impl AsyncRuntime {
         Self {
             pool,
             semaphore: Arc::new(Semaphore::new(max_connections)),
+            max_connections,
             backpressure_monitor: BackpressureMonitor::new(backpressure_threshold),
             metrics,
         }
@@ -85,12 +87,30 @@ impl RuntimeEngine for AsyncRuntime {
             0.0
         };
 
-        let backpressure_active = self.backpressure_monitor.threshold < pool_utilization;
+        // Calculate semaphore utilization
+        let available_permits = self.semaphore.available_permits();
+        let used_permits = self.max_connections.saturating_sub(available_permits);
+        let semaphore_utilization = if self.max_connections > 0 {
+            used_permits as f64 / self.max_connections as f64
+        } else {
+            0.0
+        };
+
+        let stats = RuntimeStats {
+            active_connections: pool_stats.active_connections,
+            queued_operations: available_permits,
+            pool_utilization,
+            semaphore_utilization,
+            backpressure_active: false, // Will be set below
+        };
+
+        let backpressure_active = self.backpressure_monitor.is_saturated(&stats);
 
         RuntimeStats {
             active_connections: pool_stats.active_connections,
-            queued_operations: self.semaphore.available_permits(),
+            queued_operations: available_permits,
             pool_utilization,
+            semaphore_utilization,
             backpressure_active,
         }
     }
@@ -107,15 +127,229 @@ impl RuntimeEngine for AsyncRuntime {
 
 /// Backpressure monitor
 struct BackpressureMonitor {
-    threshold: f64,
+    pool_threshold: f64,
+    semaphore_threshold: f64,
 }
 
 impl BackpressureMonitor {
     fn new(threshold: f64) -> Self {
-        Self { threshold }
+        // Use same threshold for both pool and semaphore by default
+        Self {
+            pool_threshold: threshold,
+            semaphore_threshold: threshold,
+        }
     }
 
     fn is_saturated(&self, stats: &RuntimeStats) -> bool {
-        stats.pool_utilization > self.threshold
+        let pool_saturated = stats.pool_utilization > self.pool_threshold;
+        let sem_saturated = stats.semaphore_utilization > self.semaphore_threshold;
+        pool_saturated || sem_saturated
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    // Unit tests for BackpressureMonitor
+    // (AsyncRuntime integration tests are in tests/integration/runtime_integration_test.rs)
+
+    #[test]
+    fn test_backpressure_monitor_creation() {
+        let monitor = BackpressureMonitor::new(0.8);
+        assert_eq!(monitor.pool_threshold, 0.8);
+        assert_eq!(monitor.semaphore_threshold, 0.8);
+    }
+
+    #[test]
+    fn test_backpressure_monitor_creation_various_thresholds() {
+        let monitor1 = BackpressureMonitor::new(0.5);
+        assert_eq!(monitor1.pool_threshold, 0.5);
+        assert_eq!(monitor1.semaphore_threshold, 0.5);
+
+        let monitor2 = BackpressureMonitor::new(0.9);
+        assert_eq!(monitor2.pool_threshold, 0.9);
+        assert_eq!(monitor2.semaphore_threshold, 0.9);
+
+        let monitor3 = BackpressureMonitor::new(0.0);
+        assert_eq!(monitor3.pool_threshold, 0.0);
+        assert_eq!(monitor3.semaphore_threshold, 0.0);
+
+        let monitor4 = BackpressureMonitor::new(1.0);
+        assert_eq!(monitor4.pool_threshold, 1.0);
+        assert_eq!(monitor4.semaphore_threshold, 1.0);
+    }
+
+    #[test]
+    fn test_backpressure_monitor_pool_saturation() {
+        let monitor = BackpressureMonitor::new(0.8);
+
+        let stats = RuntimeStats {
+            active_connections: 9,
+            queued_operations: 0,
+            pool_utilization: 0.9,  // Above threshold
+            semaphore_utilization: 0.5,  // Below threshold
+            backpressure_active: false,
+        };
+
+        // Should be saturated because pool is above threshold
+        assert!(monitor.is_saturated(&stats));
+    }
+
+    #[test]
+    fn test_backpressure_monitor_semaphore_saturation() {
+        let monitor = BackpressureMonitor::new(0.8);
+
+        let stats = RuntimeStats {
+            active_connections: 5,
+            queued_operations: 0,
+            pool_utilization: 0.5,  // Below threshold
+            semaphore_utilization: 0.9,  // Above threshold
+            backpressure_active: false,
+        };
+
+        // Should be saturated because semaphore is above threshold
+        assert!(monitor.is_saturated(&stats));
+    }
+
+    #[test]
+    fn test_backpressure_monitor_no_saturation() {
+        let monitor = BackpressureMonitor::new(0.8);
+
+        let stats = RuntimeStats {
+            active_connections: 5,
+            queued_operations: 0,
+            pool_utilization: 0.5,  // Below threshold
+            semaphore_utilization: 0.5,  // Below threshold
+            backpressure_active: false,
+        };
+
+        assert!(!monitor.is_saturated(&stats));
+    }
+
+    #[test]
+    fn test_backpressure_monitor_boundary_conditions() {
+        let monitor = BackpressureMonitor::new(0.8);
+
+        // Exactly at threshold - should not be saturated
+        let stats_at = RuntimeStats {
+            active_connections: 8,
+            queued_operations: 0,
+            pool_utilization: 0.8,
+            semaphore_utilization: 0.8,
+            backpressure_active: false,
+        };
+        assert!(!monitor.is_saturated(&stats_at));
+
+        // Just above threshold (pool) - should be saturated
+        let stats_above = RuntimeStats {
+            active_connections: 9,
+            queued_operations: 0,
+            pool_utilization: 0.801,
+            semaphore_utilization: 0.5,
+            backpressure_active: false,
+        };
+        assert!(monitor.is_saturated(&stats_above));
+
+        // Just below threshold - should not be saturated
+        let stats_below = RuntimeStats {
+            active_connections: 7,
+            queued_operations: 0,
+            pool_utilization: 0.799,
+            semaphore_utilization: 0.799,
+            backpressure_active: false,
+        };
+        assert!(!monitor.is_saturated(&stats_below));
+    }
+
+    #[test]
+    fn test_backpressure_monitor_edge_cases() {
+        let monitor = BackpressureMonitor::new(0.8);
+
+        // Zero utilization
+        let stats_zero = RuntimeStats {
+            active_connections: 0,
+            queued_operations: 0,
+            pool_utilization: 0.0,
+            semaphore_utilization: 0.0,
+            backpressure_active: false,
+        };
+        assert!(!monitor.is_saturated(&stats_zero));
+
+        // Full utilization
+        let stats_full = RuntimeStats {
+            active_connections: 10,
+            queued_operations: 0,
+            pool_utilization: 1.0,
+            semaphore_utilization: 1.0,
+            backpressure_active: false,
+        };
+        assert!(monitor.is_saturated(&stats_full));
+    }
+
+    #[test]
+    fn test_backpressure_monitor_different_thresholds() {
+        // Test with different threshold values
+        let monitor_low = BackpressureMonitor::new(0.5);
+        let monitor_high = BackpressureMonitor::new(0.95);
+
+        let stats = RuntimeStats {
+            active_connections: 8,
+            queued_operations: 0,
+            pool_utilization: 0.8,
+            semaphore_utilization: 0.8,
+            backpressure_active: false,
+        };
+
+        // 0.8 utilization > 0.5 threshold
+        assert!(monitor_low.is_saturated(&stats));
+
+        // 0.8 utilization < 0.95 threshold
+        assert!(!monitor_high.is_saturated(&stats));
+    }
+
+    #[test]
+    fn test_backpressure_monitor_both_sources() {
+        let monitor = BackpressureMonitor::new(0.8);
+
+        // Both saturated
+        let stats_both = RuntimeStats {
+            active_connections: 10,
+            queued_operations: 0,
+            pool_utilization: 0.9,
+            semaphore_utilization: 0.95,
+            backpressure_active: false,
+        };
+        assert!(monitor.is_saturated(&stats_both));
+
+        // Only pool saturated
+        let stats_pool = RuntimeStats {
+            active_connections: 9,
+            queued_operations: 5,
+            pool_utilization: 0.9,
+            semaphore_utilization: 0.5,
+            backpressure_active: false,
+        };
+        assert!(monitor.is_saturated(&stats_pool));
+
+        // Only semaphore saturated
+        let stats_sem = RuntimeStats {
+            active_connections: 5,
+            queued_operations: 1,
+            pool_utilization: 0.5,
+            semaphore_utilization: 0.95,
+            backpressure_active: false,
+        };
+        assert!(monitor.is_saturated(&stats_sem));
+
+        // Neither saturated
+        let stats_neither = RuntimeStats {
+            active_connections: 5,
+            queued_operations: 5,
+            pool_utilization: 0.5,
+            semaphore_utilization: 0.5,
+            backpressure_active: false,
+        };
+        assert!(!monitor.is_saturated(&stats_neither));
     }
 }

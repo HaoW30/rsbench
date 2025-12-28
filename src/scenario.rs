@@ -1296,6 +1296,7 @@ mod tests {
                 active_connections: 0,
                 queued_operations: 0,
                 pool_utilization: 0.0,
+                semaphore_utilization: 0.0,
                 backpressure_active: self.backpressure_enabled,
             }
         }
@@ -1907,6 +1908,7 @@ operations:
                     active_connections: 0,
                     queued_operations: 0,
                     pool_utilization: 0.0,
+                    semaphore_utilization: 0.0,
                     backpressure_active: false,
                 }
             }

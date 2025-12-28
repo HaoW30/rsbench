@@ -40,6 +40,7 @@ pub struct RuntimeStats {
     pub active_connections: usize,
     pub queued_operations: usize,
     pub pool_utilization: f64,
+    pub semaphore_utilization: f64,
     pub backpressure_active: bool,
 }
 
@@ -98,12 +99,14 @@ mod tests {
             active_connections: 5,
             queued_operations: 10,
             pool_utilization: 0.75,
+            semaphore_utilization: 0.5,
             backpressure_active: false,
         };
 
         assert_eq!(stats.active_connections, 5);
         assert_eq!(stats.queued_operations, 10);
         assert!((stats.pool_utilization - 0.75).abs() < f64::EPSILON);
+        assert!((stats.semaphore_utilization - 0.5).abs() < f64::EPSILON);
         assert!(!stats.backpressure_active);
     }
 
@@ -113,10 +116,12 @@ mod tests {
             active_connections: 10,
             queued_operations: 100,
             pool_utilization: 0.95,
+            semaphore_utilization: 0.9,
             backpressure_active: true,
         };
 
         assert!(stats.backpressure_active);
         assert!(stats.pool_utilization > 0.9);
+        assert!(stats.semaphore_utilization > 0.8);
     }
 }
