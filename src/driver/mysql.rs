@@ -19,7 +19,7 @@ impl DatabaseDriver for MySqlDriver {
         "mysql"
     }
 
-    async fn connect(&self, config: &ConnectionConfig) -> Result<Box<dyn Connection>> {
+    async fn connect(&self, config: &ConnectionConfig) -> Result<Box<dyn Connection + Send>> {
         let opts = mysql_async::Opts::from_url(&config.connection_string)
             .map_err(|e| DatabaseError::Connection(e.to_string()))?;
 

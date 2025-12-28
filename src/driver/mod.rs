@@ -20,7 +20,7 @@ pub trait DatabaseDriver: Send + Sync {
     fn name(&self) -> &str;
 
     /// Create new connection
-    async fn connect(&self, config: &ConnectionConfig) -> Result<Box<dyn Connection>>;
+    async fn connect(&self, config: &ConnectionConfig) -> Result<Box<dyn Connection + Send>>;
 
     /// Driver capabilities
     fn capabilities(&self) -> DriverCapabilities;

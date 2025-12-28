@@ -33,6 +33,8 @@ pub use metrics::{MetricsCollector, MetricsSnapshot};
 pub use scenario::ScenarioExecutor;
 pub use driver::DriverRegistry;
 
+// Error types are already public via the enum definitions below
+
 /// Result type for the entire tool
 pub type Result<T> = std::result::Result<T, Error>;
 
@@ -47,6 +49,9 @@ pub enum Error {
 
     #[error("Runtime error: {0}")]
     Runtime(#[from] RuntimeError),
+
+    #[error("Pool error: {0}")]
+    Pool(#[from] PoolError),
 
     #[error("Database error: {0}")]
     Database(#[from] DatabaseError),
@@ -75,6 +80,22 @@ pub enum RuntimeError {
 
     #[error("Backpressure saturation")]
     BackpressureSaturation,
+}
+
+/// Connection pool-specific errors
+#[derive(Debug, thiserror::Error)]
+pub enum PoolError {
+    #[error("Pool configuration error: {0}")]
+    Configuration(String),
+
+    #[error("Pool timeout: no connection available")]
+    Timeout,
+
+    #[error("Pool closed")]
+    Closed,
+
+    #[error("Pool error: {0}")]
+    Unknown(String),
 }
 
 /// Database-specific errors
