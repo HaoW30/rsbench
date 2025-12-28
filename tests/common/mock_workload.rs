@@ -36,6 +36,9 @@ impl MockWorkload {
             sql: sql.to_string(),
             params: vec![],
             operation_type: op_type,
+            is_transaction: false,
+            transaction_sqls: vec![],
+            transaction_params: vec![],
         });
         self
     }
@@ -67,6 +70,9 @@ impl Workload for MockWorkload {
                 sql: "SELECT 1".to_string(),
                 params: vec![],
                 operation_type: OperationType::Read,
+                is_transaction: false,
+                transaction_sqls: vec![],
+                transaction_params: vec![],
             })
         } else {
             // Cycle through the provided operations
@@ -130,6 +136,9 @@ impl MockOperationBuilder {
             sql: self.sql,
             params: self.params,
             operation_type: self.operation_type,
+            is_transaction: false,
+            transaction_sqls: vec![],
+            transaction_params: vec![],
         }
     }
 }

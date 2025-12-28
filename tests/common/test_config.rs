@@ -1,6 +1,7 @@
 //! Test configuration builders and utilities
 
 use rsbench::config::*;
+use std::path::PathBuf;
 use std::time::Duration;
 
 /// Builder for creating test configurations easily
@@ -28,11 +29,9 @@ impl TestConfigBuilder {
                 },
             },
             runtime: RuntimeConfig {
-                mode: RuntimeMode::Async {
-                    workers: 1,
-                    max_connections: 10,
-                    backpressure_threshold: 0.8,
-                },
+                workers: 1,
+                max_connections: 10,
+                backpressure_threshold: 0.8,
             },
             scenario: ScenarioConfig {
                 executor: ExecutorConfig::ConstantRate {
@@ -40,10 +39,10 @@ impl TestConfigBuilder {
                     duration: Duration::from_secs(1),
                     max_connections: 10,
                 },
-                workload: WorkloadConfig::Builtin {
-                    name: "oltp_read_write".to_string(),
-                    table_count: 1,
-                    table_size: 100,
+                workload: WorkloadConfig::Declarative {
+                    file: Some(PathBuf::from("workloads/oltp_read_write.yaml")),
+                    definition: None,
+                    overrides: None,
                 },
             },
             determinism: DeterminismConfig {
@@ -74,16 +73,21 @@ impl TestConfigBuilder {
     }
 
     pub fn with_async_runtime(mut self, workers: usize, max_connections: usize) -> Self {
-        self.config.runtime.mode = RuntimeMode::Async {
-            workers,
-            max_connections,
-            backpressure_threshold: 0.8,
-        };
+        self.config.runtime.workers = workers;
+        self.config.runtime.max_connections = max_connections;
+        self.config.runtime.backpressure_threshold = 0.8;
         self
     }
 
-    pub fn with_blocking_runtime(mut self, threads: usize) -> Self {
-        self.config.runtime.mode = RuntimeMode::Blocking { threads };
+    pub fn with_runtime_settings(
+        mut self,
+        workers: usize,
+        max_connections: usize,
+        backpressure_threshold: f64,
+    ) -> Self {
+        self.config.runtime.workers = workers;
+        self.config.runtime.max_connections = max_connections;
+        self.config.runtime.backpressure_threshold = backpressure_threshold;
         self
     }
 

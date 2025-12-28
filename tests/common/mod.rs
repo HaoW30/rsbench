@@ -7,11 +7,13 @@
 
 pub mod mock_driver;
 pub mod mock_workload;
+pub mod mock_pool;
 pub mod test_config;
 pub mod assertions;
 
 // Re-export commonly used items
 pub use mock_driver::{MockDriver, MockConnection};
 pub use mock_workload::MockWorkload;
+pub use mock_pool::MockConnectionPool;
 pub use test_config::TestConfigBuilder;
 pub use assertions::*;
