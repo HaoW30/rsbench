@@ -60,7 +60,16 @@ deadpool = { version = "0.12", features = ["managed"] }
 
 [dev-dependencies]
 proptest = "1.5"
-criterion = "0.5"
+criterion = { version = "0.5", features = ["async_tokio"] }
+futures = "0.3"
+
+[[bench]]
+name = "runtime_bench"
+harness = false
+
+[[bench]]
+name = "rate_limiter_bench"
+harness = false
 
 [features]
 default = ["mysql"]

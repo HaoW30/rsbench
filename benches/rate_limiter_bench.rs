@@ -5,7 +5,6 @@
 use criterion::{black_box, criterion_group, criterion_main, Criterion, BenchmarkId};
 use rsbench::rate_limiter::RateLimiter;
 use std::sync::Arc;
-use std::time::Duration;
 
 fn benchmark_single_threaded_throughput(c: &mut Criterion) {
     let mut group = c.benchmark_group("single_threaded");
@@ -15,12 +14,12 @@ fn benchmark_single_threaded_throughput(c: &mut Criterion) {
             BenchmarkId::from_parameter(rate),
             &rate,
             |b, &rate| {
-                let rt = tokio::runtime::Runtime::new().unwrap();
                 let limiter = RateLimiter::new(rate);
 
-                b.to_async(&rt).iter(|| async {
-                    black_box(limiter.acquire().await);
-                });
+                b.to_async(tokio::runtime::Runtime::new().unwrap())
+                    .iter(|| async {
+                        black_box(limiter.acquire().await);
+                    });
             },
         );
     }
@@ -29,7 +28,6 @@ fn benchmark_single_threaded_throughput(c: &mut Criterion) {
 }
 
 fn benchmark_concurrent_throughput(c: &mut Criterion) {
-    let rt = tokio::runtime::Runtime::new().unwrap();
     let mut group = c.benchmark_group("concurrent");
 
     for num_tasks in [10, 50, 100] {
@@ -39,18 +37,19 @@ fn benchmark_concurrent_throughput(c: &mut Criterion) {
             |b, &num_tasks| {
                 let limiter = Arc::new(RateLimiter::new(100_000));
 
-                b.to_async(&rt).iter(|| async {
-                    let handles: Vec<_> = (0..num_tasks)
-                        .map(|_| {
-                            let lim = limiter.clone();
-                            tokio::spawn(async move {
-                                black_box(lim.acquire().await);
+                b.to_async(tokio::runtime::Runtime::new().unwrap())
+                    .iter(|| async {
+                        let handles: Vec<_> = (0..num_tasks)
+                            .map(|_| {
+                                let lim = limiter.clone();
+                                tokio::spawn(async move {
+                                    black_box(lim.acquire().await);
+                                })
                             })
-                        })
-                        .collect();
+                            .collect();
 
-                    futures::future::join_all(handles).await;
-                });
+                        futures::future::join_all(handles).await;
+                    });
             },
         );
     }
@@ -59,10 +58,9 @@ fn benchmark_concurrent_throughput(c: &mut Criterion) {
 }
 
 fn benchmark_rate_accuracy(c: &mut Criterion) {
-    let rt = tokio::runtime::Runtime::new().unwrap();
-
     c.bench_function("rate_accuracy_10k", |b| {
-        b.to_async(&rt).iter(|| async {
+        b.to_async(tokio::runtime::Runtime::new().unwrap())
+            .iter(|| async {
             let limiter = RateLimiter::new(10_000);
             let start = std::time::Instant::now();
 
