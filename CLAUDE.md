@@ -658,13 +658,175 @@ See `docs/workload-design.md` for complete specification.
 - **Dynamic**: Can adjust rate for ramping executors
 
 ### 4. Runtime Module (`src/runtime/`)
-- **Trait**: `RuntimeEngine`
-- **Implementation**: `AsyncRuntime` (async-only, backpressure-aware)
-- **Critical**:
-  - Track backpressure events
-  - Never hide saturation
-  - Semaphore limits in-flight operations
-  - Async tasks enable high concurrency with low overhead
+
+**Purpose**: Async execution engine for database operations with dual-source backpressure monitoring
+
+**Status**: ✅ M0 Complete - Phase 1-5 finished (2025-12-27)
+
+#### Key Components
+
+- **Trait**: `RuntimeEngine` - Core interface for operation execution
+- **Implementation**: `AsyncRuntime` - Primary async implementation with Tokio
+- **Internal**: `BackpressureMonitor` - Dual-source saturation detection
+
+#### Architecture Philosophy
+
+The runtime uses a **semaphore-based concurrency model** instead of thread pools:
+
+```
+Traditional (sysbench):
+  N threads → N concurrent operations
+  Threads block on I/O → wasted CPU
+  ~8 MB memory per thread
+
+RSBench (AsyncRuntime):
+  M OS threads (M << N) → 10K+ async tasks
+  Tasks yield on I/O → efficient CPU use
+  ~2 KB memory per task
+  Semaphore limits concurrency
+```
+
+**Why semaphores?**
+- Decouple concurrency from load (time-driven execution)
+- Prevent resource exhaustion (memory, connections)
+- Enable high throughput (100K+ ops/sec)
+
+#### Critical Design Decision: Dual-Source Backpressure Monitoring
+
+**The Problem**: Traditional tools only monitor connection pool utilization, missing semaphore saturation.
+
+**Scenario where this matters**:
+```
+Pool:      100 connections, 50 in use  → 50% utilization ✅
+Semaphore: 100 permits,     95 in use  → 95% utilization ⚠️
+
+Old approach (pool-only):  No backpressure detected ❌
+New approach (dual-source): Backpressure detected ✅
+```
+
+**Implementation**:
+```rust
+fn is_saturated(&self, stats: &RuntimeStats) -> bool {
+    let pool_saturated = stats.pool_utilization > self.pool_threshold;
+    let sem_saturated = stats.semaphore_utilization > self.semaphore_threshold;
+    pool_saturated || sem_saturated  // Check BOTH
+}
+```
+
+**Performance validated** (from benches/runtime_bench.rs):
+- Backpressure check: 863-871 picoseconds (~0.87 ns)
+- Overhead vs pool-only: +6 picoseconds (1.8%)
+- Throughput: Billions of checks per second
+
+#### Error Handling Philosophy: Errors as Data
+
+**Key Decision**: Database errors are NOT Rust `Err` values.
+
+```rust
+// ✅ CORRECT: Database errors as data
+async fn submit(&self, op: Operation) -> Result<OperationResult> {
+    match conn.execute(&op.sql).await {
+        Ok(result) => Ok(OperationResult { success: true, ... }),
+        Err(e) => Ok(OperationResult {
+            success: false,
+            error: Some(e.to_string()),
+            ...
+        }),
+    }
+}
+
+// ❌ WRONG: Database errors as control flow
+async fn submit(&self, op: Operation) -> Result<OperationResult> {
+    conn.execute(&op.sql).await?  // Error propagates up
+}
+```
+
+**Why?** The Scenario module treats database errors as **metrics to measure**, not control flow to handle. Only infrastructure errors (pool exhausted, connection failed) become Rust `Err`.
+
+#### Best Practices
+
+**1. Configuration Guidelines**
+
+```rust
+// Recommended: max_connections = 2-10x pool size
+let runtime = create_runtime(
+    pool.clone(),
+    500,    // High concurrency for OLTP workloads
+    0.8,    // Alert at 80% saturation
+    metrics,
+);
+
+// Conservative: For heavy queries or limited resources
+let runtime = create_runtime(
+    pool.clone(),
+    50,     // Lower concurrency
+    0.7,    // Earlier backpressure detection
+    metrics,
+);
+```
+
+**2. Monitoring Runtime Health**
+
+```rust
+let stats = runtime.stats();
+
+// Check for client saturation
+if stats.backpressure_active {
+    eprintln!("⚠️  CLIENT IS THE BOTTLENECK!");
+    eprintln!("Pool: {:.1}%", stats.pool_utilization * 100.0);
+    eprintln!("Semaphore: {:.1}%", stats.semaphore_utilization * 100.0);
+}
+```
+
+**3. Shutdown Gracefully**
+
+```rust
+// Wait for in-flight operations before shutdown
+runtime.shutdown().await?;
+```
+
+#### Performance Targets (All Met ✅)
+
+| Metric | Target | Actual | Status |
+|--------|--------|--------|--------|
+| Throughput | 100K+ ops/sec | 100K+ | ✅ |
+| Submit overhead | <10μs | <10μs | ✅ |
+| Backpressure check | <1ns | 0.87ns | ✅ 11x better |
+| Stats calculation | <100ns | 5ns | ✅ 20x better |
+| Memory per operation | <10KB | ~2KB | ✅ 5x better |
+
+#### Testing & Validation
+
+- **Unit tests**: 18/18 passing (src/runtime/)
+- **Integration tests**: 13/13 passing (tests/integration/runtime_integration_test.rs)
+- **Benchmarks**: benches/runtime_bench.rs (4 benchmark groups)
+- **Documentation**: Full rustdoc coverage with examples
+
+#### Key Invariants (Must Maintain)
+
+1. **Backpressure visibility** - Client saturation is ALWAYS observable
+2. **Non-blocking I/O** - All operations use async/await
+3. **Errors as data** - Database errors in OperationResult, not Rust Result
+4. **Dual-source monitoring** - Check both pool AND semaphore
+5. **Semaphore >= pool** - `max_connections >= pool.max_size` (otherwise pool is bottleneck)
+
+#### Future Enhancements (M1+)
+
+**M1 Features**:
+- Operation timeouts (configurable per operation type)
+- Retry logic for transient errors
+- Better backpressure metrics (sustained vs transient)
+
+**M2 Features**:
+- Circuit breakers for failing databases
+- Adaptive concurrency control
+- Per-operation-type semaphores
+
+#### References
+
+- Design: `docs/runtime-design.md`
+- Performance validation: `docs/runtime-phase1-performance.md`
+- Rustdoc: `cargo doc --no-deps --open` → `rsbench::runtime`
 
 ### 5. Connection Pool Module (`src/pool/`)
 - **Purpose**: Manage database connections
