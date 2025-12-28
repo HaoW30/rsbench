@@ -28,7 +28,7 @@ pub use config::{
     ConfigLoader, ConfigSource, ToolConfig, InfrastructureConfig, ScenarioFile,
 };
 pub use workload::{Workload, WorkloadFactory, Operation};
-pub use runtime::{RuntimeEngine, RuntimeFactory};
+pub use runtime::{RuntimeEngine, create_runtime};
 pub use metrics::{MetricsCollector, MetricsSnapshot};
 pub use scenario::ScenarioExecutor;
 pub use driver::DriverRegistry;

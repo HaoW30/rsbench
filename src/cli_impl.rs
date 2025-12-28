@@ -3,7 +3,7 @@
 use rsbench::config::{OutputFormat, ToolConfig};
 use rsbench::metrics::{JsonOutput, MetricsOutput, TextOutput};
 use rsbench::pool::ConnectionPool;
-use rsbench::{DriverRegistry, MetricsCollector, Result, RuntimeFactory, ScenarioExecutor, WorkloadFactory};
+use rsbench::{DriverRegistry, MetricsCollector, Result, create_runtime, ScenarioExecutor, WorkloadFactory};
 use std::sync::Arc;
 
 pub async fn run_scenario(config: ToolConfig) -> Result<()> {
@@ -21,8 +21,13 @@ pub async fn run_scenario(config: ToolConfig) -> Result<()> {
     // 3. Create metrics collector
     let metrics = MetricsCollector::new();
 
-    // 4. Create runtime
-    let runtime = RuntimeFactory::create(&config.runtime.mode, pool.clone(), metrics.clone())?;
+    // 4. Create runtime (async-only)
+    let runtime = create_runtime(
+        pool.clone(),
+        config.runtime.max_connections,
+        config.runtime.backpressure_threshold,
+        metrics.clone(),
+    );
     let runtime = Arc::from(runtime);
 
     // 5. Create workload

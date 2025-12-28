@@ -92,39 +92,26 @@ impl ConfigLoader {
         }
 
         // Validate runtime config
-        match &config.runtime.mode {
-            RuntimeMode::Async {
-                workers,
-                max_connections,
-                backpressure_threshold,
-            } => {
-                if *workers == 0 {
-                    return Err(Error::Config("Async runtime workers must be > 0".into()));
-                }
-                if *max_connections == 0 {
-                    return Err(Error::Config(
-                        "Async runtime max_connections must be > 0".into(),
-                    ));
-                }
-                if !(*backpressure_threshold >= 0.0 && *backpressure_threshold <= 1.0) {
-                    return Err(Error::Config(format!(
-                        "Backpressure threshold must be between 0.0 and 1.0, got {}",
-                        backpressure_threshold
-                    )));
-                }
-                // Check that max_connections doesn't exceed pool max_size
-                if *max_connections > config.database.pool.max_size {
-                    return Err(Error::Config(format!(
-                        "Runtime max_connections ({}) cannot exceed pool max_size ({})",
-                        max_connections, config.database.pool.max_size
-                    )));
-                }
-            }
-            RuntimeMode::Blocking { threads } => {
-                if *threads == 0 {
-                    return Err(Error::Config("Blocking runtime threads must be > 0".into()));
-                }
-            }
+        if config.runtime.workers == 0 {
+            return Err(Error::Config("Runtime workers must be > 0".into()));
+        }
+        if config.runtime.max_connections == 0 {
+            return Err(Error::Config(
+                "Runtime max_connections must be > 0".into(),
+            ));
+        }
+        if !(config.runtime.backpressure_threshold >= 0.0 && config.runtime.backpressure_threshold <= 1.0) {
+            return Err(Error::Config(format!(
+                "Backpressure threshold must be between 0.0 and 1.0, got {}",
+                config.runtime.backpressure_threshold
+            )));
+        }
+        // Check that max_connections doesn't exceed pool max_size
+        if config.runtime.max_connections > config.database.pool.max_size {
+            return Err(Error::Config(format!(
+                "Runtime max_connections ({}) cannot exceed pool max_size ({})",
+                config.runtime.max_connections, config.database.pool.max_size
+            )));
         }
 
         // Validate executor config
@@ -254,16 +241,6 @@ impl ConfigLoader {
                 } => {
                     *config_duration = duration;
                 }
-            }
-        }
-
-        // Override runtime threads if provided (only for Blocking mode)
-        if let Some(threads) = cli_args.threads {
-            if let RuntimeMode::Blocking {
-                threads: ref mut config_threads,
-            } = file_config.runtime.mode
-            {
-                *config_threads = threads;
             }
         }
 
@@ -420,38 +397,19 @@ fn default_idle_timeout() -> Duration {
     Duration::from_secs(300)
 }
 
-/// Runtime configuration
+/// Runtime configuration (async-only)
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct RuntimeConfig {
-    #[serde(flatten)]
-    pub mode: RuntimeMode,
+    #[serde(default = "default_workers")]
+    pub workers: usize,
+
+    #[serde(default = "default_max_connections")]
+    pub max_connections: usize,
+
+    #[serde(default = "default_backpressure_threshold")]
+    pub backpressure_threshold: f64,
 }
 
-/// Runtime execution mode
-#[derive(Debug, Clone, Serialize, Deserialize)]
-#[serde(tag = "type", rename_all = "lowercase")]
-pub enum RuntimeMode {
-    /// Blocking mode (sysbench compatibility)
-    Blocking {
-        #[serde(default = "default_threads")]
-        threads: usize,
-    },
-    /// Async mode (primary, backpressure-aware)
-    Async {
-        #[serde(default = "default_workers")]
-        workers: usize,
-
-        #[serde(default = "default_max_connections")]
-        max_connections: usize,
-
-        #[serde(default = "default_backpressure_threshold")]
-        backpressure_threshold: f64,
-    },
-}
-
-fn default_threads() -> usize {
-    16
-}
 fn default_workers() -> usize {
     num_cpus::get()
 }
@@ -738,33 +696,16 @@ output:
     }
 
     #[test]
-    fn test_runtime_mode_async() {
-        let mode = RuntimeMode::Async {
+    fn test_runtime_config() {
+        let runtime = RuntimeConfig {
             workers: 4,
             max_connections: 10,
             backpressure_threshold: 0.8,
         };
 
-        match mode {
-            RuntimeMode::Async { workers, max_connections, backpressure_threshold } => {
-                assert_eq!(workers, 4);
-                assert_eq!(max_connections, 10);
-                assert!((backpressure_threshold - 0.8).abs() < f64::EPSILON);
-            }
-            _ => panic!("Expected Async mode"),
-        }
-    }
-
-    #[test]
-    fn test_runtime_mode_blocking() {
-        let mode = RuntimeMode::Blocking { threads: 8 };
-
-        match mode {
-            RuntimeMode::Blocking { threads } => {
-                assert_eq!(threads, 8);
-            }
-            _ => panic!("Expected Blocking mode"),
-        }
+        assert_eq!(runtime.workers, 4);
+        assert_eq!(runtime.max_connections, 10);
+        assert!((runtime.backpressure_threshold - 0.8).abs() < f64::EPSILON);
     }
 
     #[test]
@@ -845,7 +786,7 @@ output:
 
         let config = result.unwrap();
         assert_eq!(config.database.driver, "mysql");
-        assert!(matches!(config.runtime.mode, RuntimeMode::Async { .. }));
+        assert!(config.runtime.workers > 0);
     }
 
     #[test]
@@ -894,7 +835,7 @@ output:
         let merged = ConfigLoader::merge_infrastructure_and_scenario(infra, scenario_file);
 
         assert_eq!(merged.database.driver, "mysql");
-        assert!(matches!(merged.runtime.mode, RuntimeMode::Async { .. }));
+        assert!(merged.runtime.workers > 0);
         assert!(matches!(
             merged.scenario.executor,
             ExecutorConfig::ConstantRate { .. }
@@ -1528,50 +1469,6 @@ output:
                 assert_eq!(duration, Duration::from_secs(120));
             }
             _ => panic!("Expected ConstantRate executor"),
-        }
-    }
-
-    #[test]
-    fn test_merge_cli_overrides_threads() {
-        let yaml = r#"
-database:
-  driver: mysql
-  connection_string: "mysql://localhost/test"
-
-runtime:
-  type: blocking
-  threads: 8
-
-scenario:
-  executor:
-    type: constant-rate
-    rate: 1000
-    duration: 60s
-    max_connections: 10
-  workload:
-    type: declarative
-    file: workloads/oltp_read_write.yaml
-
-output:
-  format: text
-"#;
-
-        let config = ConfigLoader::load(ConfigSource::Yaml(yaml.to_string())).unwrap();
-        let cli_args = CliArgs {
-            config_file: None,
-            database_url: None,
-            rate: None,
-            duration: None,
-            threads: Some(16),
-            output_format: None,
-        };
-
-        let merged = ConfigLoader::merge(config, cli_args);
-        match merged.runtime.mode {
-            RuntimeMode::Blocking { threads } => {
-                assert_eq!(threads, 16);
-            }
-            _ => panic!("Expected Blocking runtime"),
         }
     }
 

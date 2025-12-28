@@ -1,14 +1,11 @@
 //! Runtime module
 //!
-//! Execution engines for database operations.
+//! Execution engine for database operations.
 
 mod async_runtime;
-mod blocking;
 
 pub use async_runtime::AsyncRuntime;
-pub use blocking::BlockingRuntime;
 
-use crate::config::RuntimeMode;
 use crate::metrics::MetricsCollector;
 use crate::pool::ConnectionPool;
 use crate::workload::Operation;
@@ -46,31 +43,19 @@ pub struct RuntimeStats {
     pub backpressure_active: bool,
 }
 
-/// Factory for creating runtime instances
-pub struct RuntimeFactory;
-
-impl RuntimeFactory {
-    pub fn create(
-        mode: &RuntimeMode,
-        pool: Arc<ConnectionPool>,
-        metrics: Arc<MetricsCollector>,
-    ) -> Result<Box<dyn RuntimeEngine>> {
-        match mode {
-            RuntimeMode::Async {
-                max_connections,
-                backpressure_threshold,
-                ..
-            } => Ok(Box::new(AsyncRuntime::new(
-                pool,
-                *max_connections,
-                *backpressure_threshold,
-                metrics,
-            ))),
-            RuntimeMode::Blocking { threads } => {
-                Ok(Box::new(BlockingRuntime::new(pool, *threads, metrics)))
-            }
-        }
-    }
+/// Create a runtime instance from configuration
+pub fn create_runtime(
+    pool: Arc<ConnectionPool>,
+    max_connections: usize,
+    backpressure_threshold: f64,
+    metrics: Arc<MetricsCollector>,
+) -> Box<dyn RuntimeEngine> {
+    Box::new(AsyncRuntime::new(
+        pool,
+        max_connections,
+        backpressure_threshold,
+        metrics,
+    ))
 }
 
 #[cfg(test)]

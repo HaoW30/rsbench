@@ -659,13 +659,12 @@ See `docs/workload-design.md` for complete specification.
 
 ### 4. Runtime Module (`src/runtime/`)
 - **Trait**: `RuntimeEngine`
-- **Implementations**:
-  - `AsyncRuntime` (primary): Backpressure-aware, high throughput
-  - `BlockingRuntime` (compatibility): Sysbench-style
+- **Implementation**: `AsyncRuntime` (async-only, backpressure-aware)
 - **Critical**:
   - Track backpressure events
   - Never hide saturation
   - Semaphore limits in-flight operations
+  - Async tasks enable high concurrency with low overhead
 
 ### 5. Connection Pool Module (`src/pool/`)
 - **Purpose**: Manage database connections
@@ -1085,8 +1084,22 @@ Or install LuaJIT and build with: `cargo build --features lua`
 ---
 
 **Project Version**: M0 Alpha
-**Last Updated**: 2025-12-26
+**Last Updated**: 2025-12-27
 **Status**: Module structure complete, implementation in progress
+
+**Recent Updates (2025-12-27)**:
+- ✅ **Removed BlockingRuntime** - Simplified runtime module to async-only execution
+  - Deleted `src/runtime/blocking.rs` (86 lines)
+  - Removed `RuntimeMode::Blocking` enum variant from config
+  - Simplified runtime creation (direct function call instead of factory pattern)
+  - Rationale: BlockingRuntime didn't provide true sysbench-style blocking semantics
+    - Just wrapped async operations in `spawn_blocking` threads
+    - No semantic difference from AsyncRuntime for scenario module (both fire-and-forget)
+    - Closed-loop executor (M0/M1) provides the worker-driven sequential execution pattern
+  - Benefits: Simpler codebase, clearer semantics, single execution model
+  - **Note**: 5 pre-existing ClosedLoop executor test failures (unrelated to this change)
+    - Bug: `RateLimiter::new(u64::MAX)` causes overflow in `rate * 2`
+    - Fix deferred: Make rate_limiter optional for ClosedLoop executor
 
 **Recent Updates (2025-12-26)**:
 - ✅ Added comprehensive backpressure awareness documentation
