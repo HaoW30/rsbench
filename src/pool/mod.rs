@@ -18,6 +18,7 @@ use deadpool::Runtime;
 use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::Arc;
 use std::time::Duration;
+use tracing::{debug, info, warn, error};
 
 /// Connection pool with real pooling via deadpool
 ///
@@ -75,8 +76,13 @@ pub struct ConnectionPool {
     inner: Pool<DriverManager>,
 
     /// Configuration for reference and stats
-    #[allow(dead_code)]
     config: PoolConfig,
+
+    /// Health metrics - total successful checkouts
+    total_checkouts: Arc<AtomicUsize>,
+
+    /// Health metrics - total connection errors
+    connection_errors: Arc<AtomicUsize>,
 }
 
 impl ConnectionPool {
@@ -153,7 +159,21 @@ impl ConnectionPool {
                 ))
             })?;
 
-        Ok(Self { inner, config })
+        let pool = Self {
+            inner,
+            config,
+            total_checkouts: Arc::new(AtomicUsize::new(0)),
+            connection_errors: Arc::new(AtomicUsize::new(0)),
+        };
+
+        info!(
+            max_size = pool.config.max_size,
+            min_size = pool.config.min_size,
+            connection_timeout_ms = pool.config.connection_timeout.as_millis(),
+            "Connection pool created"
+        );
+
+        Ok(pool)
     }
 
     /// Pre-warm the pool by creating min_size connections
@@ -237,7 +257,7 @@ impl ConnectionPool {
     /// ```
     pub async fn get(&self) -> Result<PooledConnection> {
         // Get connection from deadpool with timeout
-        let conn = self
+        let result = self
             .inner
             .get()
             .await
@@ -250,9 +270,42 @@ impl ConnectionPool {
                 }
                 deadpool::managed::PoolError::Backend(e) => e,
                 _ => crate::Error::Pool(crate::PoolError::Unknown(e.to_string())),
-            })?;
+            });
 
-        Ok(PooledConnection { inner: conn })
+        // Track metrics and log events
+        match &result {
+            Ok(_) => {
+                // Successful checkout
+                let checkout_count = self.total_checkouts.fetch_add(1, Ordering::Relaxed) + 1;
+                debug!(
+                    checkout_count,
+                    active = self.inner.status().size - self.inner.status().available,
+                    "Connection checked out from pool"
+                );
+            }
+            Err(e) => {
+                // Connection error
+                let error_count = self.connection_errors.fetch_add(1, Ordering::Relaxed) + 1;
+                error!(
+                    error_count,
+                    error = %e,
+                    "Failed to get connection from pool"
+                );
+
+                // Warn if pool is saturated
+                let status = self.inner.status();
+                if status.waiting > 0 {
+                    warn!(
+                        pending_requests = status.waiting,
+                        total_connections = status.size,
+                        available = status.available,
+                        "Pool saturation detected - requests waiting for connections"
+                    );
+                }
+            }
+        }
+
+        result.map(|conn| PooledConnection { inner: conn })
     }
 
     /// Get pool statistics
@@ -292,10 +345,16 @@ impl ConnectionPool {
         let status = self.inner.status();
 
         PoolStats {
+            // Pool metrics
             total_connections: status.size,
             active_connections: status.size - status.available,
             idle_connections: status.available,
             pending_requests: status.waiting,
+
+            // Health metrics
+            total_checkouts: self.total_checkouts.load(Ordering::Relaxed),
+            connection_errors: self.connection_errors.load(Ordering::Relaxed),
+            max_lifetime: Some(self.config.idle_timeout),
         }
     }
 }
@@ -406,13 +465,19 @@ impl PooledConnection {
 // Drop automatically returns connection to pool
 // No manual implementation needed - deadpool handles it
 
-/// Pool statistics
+/// Pool statistics with health monitoring
 #[derive(Debug, Clone)]
 pub struct PoolStats {
+    // Connection pool metrics
     pub total_connections: usize,
     pub active_connections: usize,
     pub idle_connections: usize,
     pub pending_requests: usize,
+
+    // Health monitoring metrics
+    pub total_checkouts: usize,
+    pub connection_errors: usize,
+    pub max_lifetime: Option<Duration>,
 }
 
 #[cfg(test)]
@@ -428,12 +493,18 @@ mod tests {
             active_connections: 5,
             idle_connections: 5,
             pending_requests: 0,
+            total_checkouts: 100,
+            connection_errors: 2,
+            max_lifetime: Some(Duration::from_secs(600)),
         };
 
         assert_eq!(stats.total_connections, 10);
         assert_eq!(stats.active_connections, 5);
         assert_eq!(stats.idle_connections, 5);
         assert_eq!(stats.pending_requests, 0);
+        assert_eq!(stats.total_checkouts, 100);
+        assert_eq!(stats.connection_errors, 2);
+        assert_eq!(stats.max_lifetime, Some(Duration::from_secs(600)));
     }
 
     #[test]
@@ -443,11 +514,16 @@ mod tests {
             active_connections: 10,
             idle_connections: 0,
             pending_requests: 5,
+            total_checkouts: 50,
+            connection_errors: 10,
+            max_lifetime: Some(Duration::from_secs(300)),
         };
 
         assert_eq!(stats.active_connections, stats.total_connections);
         assert_eq!(stats.idle_connections, 0);
         assert!(stats.pending_requests > 0);
+        assert_eq!(stats.total_checkouts, 50);
+        assert_eq!(stats.connection_errors, 10);
     }
 
     #[tokio::test(flavor = "multi_thread")]
@@ -694,5 +770,116 @@ mod tests {
 
         // Should timeout quickly (within 1 second), not wait for full 10 seconds
         assert!(elapsed < Duration::from_secs(1), "Timeout took too long: {:?}", elapsed);
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn test_health_metrics_tracking() {
+        use crate::driver::{ConnectionConfig, DatabaseDriver, DriverCapabilities, QueryResult};
+
+        // Track successful and failed connections
+        struct MetricsTestDriver {
+            fail_count: Arc<AtomicUsize>,
+        }
+
+        #[async_trait::async_trait]
+        impl DatabaseDriver for MetricsTestDriver {
+            fn name(&self) -> &str {
+                "metrics-test"
+            }
+
+            async fn connect(
+                &self,
+                _config: &ConnectionConfig,
+            ) -> Result<Box<dyn Connection + Send>> {
+                // Fail first 2 attempts, then succeed
+                let count = self.fail_count.fetch_add(1, Ordering::SeqCst);
+                if count < 2 {
+                    Err(crate::Error::Database(crate::DatabaseError::Connection(
+                        format!("Simulated failure #{}", count + 1),
+                    )))
+                } else {
+                    Ok(Box::new(MetricsTestConnection))
+                }
+            }
+
+            fn capabilities(&self) -> DriverCapabilities {
+                DriverCapabilities {
+                    supports_transactions: true,
+                    supports_prepared_statements: true,
+                }
+            }
+        }
+
+        struct MetricsTestConnection;
+
+        #[async_trait::async_trait]
+        impl Connection for MetricsTestConnection {
+            async fn execute(
+                &mut self,
+                _sql: &str,
+                _params: &[crate::Value],
+            ) -> Result<QueryResult> {
+                Ok(QueryResult {
+                    rows_affected: 0,
+                    last_insert_id: None,
+                })
+            }
+
+            async fn begin(&mut self) -> Result<()> {
+                Ok(())
+            }
+
+            async fn commit(&mut self) -> Result<()> {
+                Ok(())
+            }
+
+            async fn rollback(&mut self) -> Result<()> {
+                Ok(())
+            }
+
+            async fn ping(&mut self) -> Result<()> {
+                Ok(())
+            }
+        }
+
+        let fail_count = Arc::new(AtomicUsize::new(0));
+        let driver = Arc::new(MetricsTestDriver {
+            fail_count: fail_count.clone(),
+        });
+
+        let config = PoolConfig {
+            min_size: 1,
+            max_size: 10,
+            connection_timeout: Duration::from_secs(5),
+            idle_timeout: Duration::from_secs(60),
+        };
+
+        let pool = ConnectionPool::new(driver, "metrics://localhost".to_string(), config).unwrap();
+
+        // Initial stats - no activity
+        let stats = pool.stats();
+        assert_eq!(stats.total_checkouts, 0);
+        assert_eq!(stats.connection_errors, 0);
+
+        // Try to get connections - first 2 will fail
+        let _ = pool.get().await; // Fail #1
+        let _ = pool.get().await; // Fail #2
+        let conn3 = pool.get().await; // Success #1
+
+        // Check metrics after failures and success
+        let stats = pool.stats();
+        assert_eq!(stats.connection_errors, 2, "Should have 2 connection errors");
+        assert_eq!(stats.total_checkouts, 1, "Should have 1 successful checkout");
+
+        // Get more successful connections
+        drop(conn3);
+        let _conn4 = pool.get().await.unwrap(); // Success #2
+        let _conn5 = pool.get().await.unwrap(); // Success #3
+
+        // Final metrics check
+        let stats = pool.stats();
+        assert_eq!(stats.connection_errors, 2, "Still 2 errors");
+        assert_eq!(stats.total_checkouts, 3, "Now 3 successful checkouts");
+        assert_eq!(stats.max_lifetime, Some(Duration::from_secs(60)));
     }
 }

@@ -8,6 +8,7 @@ use crate::{Error, Result};
 use deadpool::managed::{Manager, RecycleError, RecycleResult};
 use std::sync::Arc;
 use std::time::Duration;
+use tracing::{debug, warn};
 
 /// Deadpool manager that adapts our DatabaseDriver trait
 ///
@@ -166,11 +167,16 @@ impl Manager for DriverManager {
         match conn.ping().await {
             Ok(_) => {
                 // Connection is healthy
+                debug!("Connection health check passed, returning to pool");
                 Ok(())
             }
             Err(e) => {
                 // Connection is broken, discard it
                 // deadpool will create a new one
+                warn!(
+                    error = %e,
+                    "Connection health check failed, discarding connection"
+                );
                 Err(RecycleError::Backend(e))
             }
         }
