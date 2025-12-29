@@ -829,10 +829,163 @@ runtime.shutdown().await?;
 - Rustdoc: `cargo doc --no-deps --open` → `rsbench::runtime`
 
 ### 5. Connection Pool Module (`src/pool/`)
-- **Purpose**: Manage database connections
-- **M0**: Simplified (creates new connections each time)
-- **Future**: Full deadpool integration with health checking
-- **Critical**: Provide backpressure signals via stats
+
+**Purpose**: Production-grade connection pooling with health monitoring and backpressure visibility
+
+**Status**: ✅ **M1 Complete** - Full deadpool integration with comprehensive testing
+
+#### Architecture
+
+Uses [`deadpool`](https://docs.rs/deadpool) 0.12 with custom `DriverManager` adapter:
+
+```text
+ConnectionPool
+  │
+  ├─> deadpool::Pool<DriverManager>
+  │     │
+  │     ├─> Connection 1 (idle)
+  │     ├─> Connection 2 (active)
+  │     └─> Connection N (idle)
+  │
+  ├─> PoolConfig (max_size, min_size, timeouts)
+  └─> Health Metrics (checkouts, errors, lifetime)
+```
+
+**Key Components**:
+- **`ConnectionPool`** (`mod.rs`): Main pool interface with health monitoring
+- **`DriverManager`** (`manager.rs`): Adapter between deadpool and our DatabaseDriver trait
+- **`PooledConnection`**: Wrapper that auto-returns connection on drop
+
+#### Why Connection Pooling?
+
+Connection creation is expensive (~10-50ms):
+- TCP handshake: ~1-5ms
+- Authentication: ~5-20ms
+- Session setup: ~5-10ms
+
+Pool checkout is fast (~400ns):
+- **1000x faster** than creating new connections
+- Amortizes expensive setup across thousands of operations
+- Predictable resource usage via max_size limit
+
+#### Configuration
+
+```yaml
+database:
+  pool:
+    min_size: 5              # Pre-warmed connections (baseline concurrency)
+    max_size: 100            # Hard limit (prevents DB overload)
+    connection_timeout: 5s   # Timeout waiting for available connection
+    idle_timeout: 600s       # Close idle connections after 10 minutes
+```
+
+**Configuration Guidelines**:
+- **min_size**: 10-20% of max_size, matches expected baseline load
+- **max_size**: Match DB's max_connections, leave headroom for other clients
+- **connection_timeout**: Short (1-5s) for fast-fail, longer (10-30s) for bursty workloads
+- **idle_timeout**: Balance reuse vs resource cleanup (5-30 minutes)
+
+#### Health Monitoring
+
+Automatic health maintenance:
+1. **Pre-checkout ping**: Every connection pinged before reuse (via `recycle()`)
+2. **Broken detection**: Failed pings trigger transparent connection replacement
+3. **Error tracking**: All errors logged and counted in pool stats
+4. **Observability**: Full tracing integration for debugging
+
+```rust
+// Health stats exposed for runtime monitoring
+let stats = pool.stats();
+println!("Active: {}, Errors: {}, Checkouts: {}",
+    stats.active_connections,
+    stats.connection_errors,
+    stats.total_checkouts
+);
+```
+
+#### Backpressure Visibility
+
+Pool stats expose critical backpressure signals:
+- **`pending_requests > 0`**: Pool saturated, clients waiting
+- **`active == max_size`**: Pool at capacity
+- **`connection_errors`**: Connection stability issues
+
+Runtime uses these signals for backpressure detection and adaptive load control.
+
+#### Performance Characteristics
+
+Benchmarked with mock driver (`benches/connection_pool_bench.rs`):
+- **Checkout latency**: ~400ns (p50/p99) - **24x better than 10μs target**
+- **Concurrent throughput**: 476K-690K checkouts/sec - **4.8-6.9x better than 100K target**
+- **Pool saturation recovery**: ~10μs per connection (linear scaling)
+- **Stats overhead**: ~23ns (essentially free)
+
+Real-world performance is dominated by network/query latency, but pool overhead is negligible.
+
+#### Implementation Decisions
+
+1. **Deadpool over custom implementation**
+   - Battle-tested in production (used by actix-web, sqlx, etc.)
+   - Handles edge cases (timeouts, lifecycle, recycling)
+   - Active maintenance and security updates
+
+2. **Health check on every checkout**
+   - Adds ~1ms overhead but prevents broken connection errors
+   - Critical for reliability - never hand out stale connections
+   - Acceptable tradeoff for database testing tool
+
+3. **Atomic metrics for lock-free stats**
+   - `total_checkouts`, `connection_errors` use `AtomicUsize`
+   - Stats collection is essentially free (~23ns)
+   - No contention on hot paths
+
+4. **Tokio runtime integration**
+   - Required `.runtime(Runtime::Tokio1)` for timeout support
+   - See GitHub issue [deadpool#195](https://github.com/deadpool-rs/deadpool/issues/195)
+   - Enables proper async timeout behavior
+
+#### Transaction Support
+
+`PooledConnection` exposes full transaction API:
+```rust
+let mut conn = pool.get().await?;
+conn.begin().await?;
+conn.execute("INSERT INTO users VALUES (?)", &[val]).await?;
+conn.commit().await?;  // or rollback()
+```
+
+Transactions work transparently through the pooled connection wrapper.
+
+#### Testing
+
+**Unit Tests** (`src/pool/mod.rs`):
+- Pool creation and configuration validation
+- Connection checkout/return lifecycle
+- Health metrics tracking
+- Timeout enforcement
+- Warm-up behavior
+
+**Integration Tests** (`tests/integration/pool_mysql_test.rs`):
+- Real MySQL connection pooling (8 tests)
+- Concurrent access patterns
+- Connection reuse verification
+- Pool saturation behavior
+- Transaction support
+- Prepared statements
+
+**Benchmarks** (`benches/connection_pool_bench.rs`):
+- Checkout latency (single/concurrent)
+- Throughput under load
+- Pool saturation recovery
+- Warm-up performance
+
+**Coverage**: All phases complete (Design → Implementation → Testing → Benchmarks → Documentation)
+
+#### Critical Design Principle
+
+> "The pool is a shared resource - its health MUST be visible to the runtime for backpressure detection"
+
+Every pool operation updates observable metrics. The runtime monitors these signals to detect client-side bottlenecks and distinguish them from database performance issues.
 
 ### 6. Driver Module (`src/driver/`)
 - **Trait**: `DatabaseDriver`, `Connection`

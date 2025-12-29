@@ -10,3 +10,4 @@ mod metrics_integration_test;
 mod runtime_integration_test;
 mod scenario_integration_test;
 mod rate_limiter_integration_test;
+mod pool_mysql_test;

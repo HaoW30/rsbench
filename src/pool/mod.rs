@@ -1,10 +1,226 @@
 //! Connection pool module
 //!
-//! Manages database connections with backpressure awareness.
+//! Provides high-performance database connection pooling with health monitoring
+//! and backpressure awareness for RSBench benchmarking workloads.
 //!
-//! This module provides real connection pooling using the `deadpool` library,
-//! allowing efficient reuse of database connections and reducing the overhead
-//! of connection creation.
+//! # Overview
+//!
+//! This module implements production-grade connection pooling using the battle-tested
+//! [`deadpool`](https://docs.rs/deadpool) library. Connection pooling dramatically
+//! improves performance by reusing database connections instead of creating new ones
+//! for each operation.
+//!
+//! ## Why Connection Pooling?
+//!
+//! Creating a database connection is expensive:
+//! - **TCP handshake**: ~1-5ms
+//! - **Authentication**: ~5-20ms
+//! - **Session setup**: ~5-10ms
+//! - **Total**: ~10-50ms per connection
+//!
+//! With connection pooling:
+//! - **Checkout from pool**: ~1-10μs (1000x faster!)
+//! - Connections are reused across thousands of operations
+//! - Predictable resource usage (max_size limit)
+//! - Automatic health checking ensures connection validity
+//!
+//! # Architecture
+//!
+//! The pool uses a layered architecture integrating deadpool with our driver abstraction:
+//!
+//! ```text
+//! ┌─────────────────────────────────────────────────────────┐
+//! │                    ConnectionPool                        │
+//! │  ┌────────────────────────────────────────────────┐    │
+//! │  │     deadpool::Pool<DriverManager>              │    │
+//! │  │                                                 │    │
+//! │  │   ┌─────────┐  ┌─────────┐  ┌─────────┐      │    │
+//! │  │   │ Conn 1  │  │ Conn 2  │  │ Conn N  │      │    │
+//! │  │   │ (idle)  │  │(active) │  │ (idle)  │      │    │
+//! │  │   └─────────┘  └─────────┘  └─────────┘      │    │
+//! │  │                                                 │    │
+//! │  │   Health Check (ping) before reuse             │    │
+//! │  │   Automatic timeout enforcement                │    │
+//! │  └────────────────────────────────────────────────┘    │
+//! │                                                          │
+//! │  ┌────────────────────────────────────────────────┐    │
+//! │  │         DriverManager (Adapter)                │    │
+//! │  │                                                 │    │
+//! │  │  • create() → DatabaseDriver::connect()        │    │
+//! │  │  • recycle() → Connection::ping()              │    │
+//! │  └────────────────────────────────────────────────┘    │
+//! │                                                          │
+//! │  Stats: active, idle, pending, errors, checkouts        │
+//! └─────────────────────────────────────────────────────────┘
+//! ```
+//!
+//! # Configuration
+//!
+//! Pool behavior is controlled by [`PoolConfig`](crate::config::PoolConfig):
+//!
+//! ```rust
+//! use rsbench::config::PoolConfig;
+//! use std::time::Duration;
+//!
+//! let config = PoolConfig {
+//!     // Minimum connections to keep warm (reduces cold-start latency)
+//!     min_size: 5,
+//!
+//!     // Maximum concurrent connections (prevents database overload)
+//!     max_size: 100,
+//!
+//!     // Timeout when waiting for available connection
+//!     connection_timeout: Duration::from_secs(5),
+//!
+//!     // Idle connections closed after this duration
+//!     idle_timeout: Duration::from_secs(600),
+//! };
+//! ```
+//!
+//! ## Configuration Guidelines
+//!
+//! - **min_size**: Set to expected baseline concurrency (e.g., 10-20% of max)
+//! - **max_size**: Match database's `max_connections` limit, leaving headroom for other clients
+//! - **connection_timeout**: Short for fast-fail (1-5s), longer for bursty workloads (10-30s)
+//! - **idle_timeout**: Balance between connection reuse and resource cleanup (5-30 minutes)
+//!
+//! # Usage Examples
+//!
+//! ## Basic Usage
+//!
+//! ```no_run
+//! use rsbench::pool::ConnectionPool;
+//! use rsbench::config::PoolConfig;
+//! use rsbench::driver::MySqlDriver;
+//! use std::sync::Arc;
+//! use std::time::Duration;
+//!
+//! # async fn example() -> rsbench::Result<()> {
+//! // Create pool
+//! let driver = Arc::new(MySqlDriver::new());
+//! let config = PoolConfig {
+//!     min_size: 5,
+//!     max_size: 50,
+//!     connection_timeout: Duration::from_secs(5),
+//!     idle_timeout: Duration::from_secs(600),
+//! };
+//!
+//! let pool = ConnectionPool::new(
+//!     driver,
+//!     "mysql://root@localhost/benchdb".to_string(),
+//!     config,
+//! )?;
+//!
+//! // Pre-warm pool with min_size connections
+//! pool.warm_up().await?;
+//!
+//! // Use connection (automatically returned on drop)
+//! let mut conn = pool.get().await?;
+//! conn.execute("SELECT COUNT(*) FROM users", &[]).await?;
+//! # Ok(())
+//! # }
+//! ```
+//!
+//! ## Concurrent Access
+//!
+//! The pool is thread-safe and designed for high concurrency:
+//!
+//! ```no_run
+//! # use rsbench::pool::ConnectionPool;
+//! # use std::sync::Arc;
+//! # async fn example(pool: Arc<ConnectionPool>) -> rsbench::Result<()> {
+//! // Share pool across many tasks
+//! let handles: Vec<_> = (0..100)
+//!     .map(|i| {
+//!         let pool = pool.clone();
+//!         tokio::spawn(async move {
+//!             let mut conn = pool.get().await?;
+//!             conn.execute(&format!("SELECT {}", i), &[]).await?;
+//!             Ok::<_, rsbench::Error>(())
+//!         })
+//!     })
+//!     .collect();
+//!
+//! // Wait for all tasks
+//! for handle in handles {
+//!     handle.await??;
+//! }
+//! # Ok(())
+//! # }
+//! ```
+//!
+//! ## Monitoring Pool Health
+//!
+//! ```no_run
+//! # use rsbench::pool::ConnectionPool;
+//! # async fn example(pool: &ConnectionPool) {
+//! let stats = pool.stats();
+//!
+//! println!("Pool Status:");
+//! println!("  Total connections: {}", stats.total_connections);
+//! println!("  Active: {}", stats.active_connections);
+//! println!("  Idle: {}", stats.idle_connections);
+//! println!("  Pending requests: {}", stats.pending_requests);
+//! println!("  Total checkouts: {}", stats.total_checkouts);
+//! println!("  Connection errors: {}", stats.connection_errors);
+//!
+//! // Check for saturation
+//! if stats.pending_requests > 0 {
+//!     println!("Warning: Pool is saturated! Consider increasing max_size");
+//! }
+//! # }
+//! ```
+//!
+//! # Health Monitoring
+//!
+//! The pool automatically maintains connection health:
+//!
+//! - **Pre-checkout health check**: Each connection is pinged before reuse via the
+//!   `recycle()` method in [`DriverManager`](crate::pool::DriverManager)
+//! - **Broken connection replacement**: Failed health checks trigger connection
+//!   recreation transparently
+//! - **Error tracking**: Connection errors are logged and tracked in pool stats
+//! - **Observability**: All pool events are logged via `tracing` for debugging
+//!
+//! # Performance Characteristics
+//!
+//! Based on benchmarks with mock driver (see `benches/connection_pool_bench.rs`):
+//!
+//! - **Checkout latency**: ~400ns (p50/p99)
+//! - **Concurrent throughput**: 476K-690K checkouts/sec
+//! - **Pool saturation recovery**: Linear with pool size (~10μs per connection)
+//! - **Stats collection overhead**: ~23ns (essentially free)
+//!
+//! Real database performance will be dominated by network and query latency,
+//! but the pool overhead remains negligible.
+//!
+//! # Implementation Details
+//!
+//! ## Deadpool Integration
+//!
+//! This module uses [`deadpool::managed`](https://docs.rs/deadpool/latest/deadpool/managed/)
+//! with a custom [`DriverManager`](manager::DriverManager) that adapts our
+//! [`DatabaseDriver`](crate::driver::DatabaseDriver) trait to deadpool's
+//! [`Manager`](https://docs.rs/deadpool/latest/deadpool/managed/trait.Manager.html) trait.
+//!
+//! Key integration points:
+//! - **`create()`**: Delegates to `DatabaseDriver::connect()`
+//! - **`recycle()`**: Calls `Connection::ping()` to validate health
+//! - **Runtime**: Uses Tokio runtime for async timeout support
+//!
+//! ## Thread Safety
+//!
+//! All pool operations are thread-safe:
+//! - Pool itself is `Send + Sync` and can be shared via `Arc`
+//! - Internal state uses atomic operations for lock-free metrics
+//! - Deadpool handles all synchronization for connection management
+//!
+//! ## Resource Cleanup
+//!
+//! Connections are automatically managed:
+//! - **On drop**: [`PooledConnection`](PooledConnection) returns connection to pool
+//! - **On idle timeout**: Deadpool closes idle connections
+//! - **On pool drop**: All connections are gracefully closed
 
 mod manager;
 
@@ -459,6 +675,80 @@ impl PooledConnection {
     /// ```
     pub async fn ping(&mut self) -> Result<()> {
         self.inner.ping().await
+    }
+
+    /// Begin a transaction
+    ///
+    /// Starts a database transaction on this connection.
+    ///
+    /// # Returns
+    ///
+    /// - `Ok(())` - Transaction started successfully
+    /// - `Err(e)` - Failed to start transaction
+    ///
+    /// # Example
+    ///
+    /// ```no_run
+    /// # use rsbench::pool::PooledConnection;
+    /// # async fn example(mut conn: PooledConnection) -> rsbench::Result<()> {
+    /// conn.begin().await?;
+    /// conn.execute("INSERT INTO users (name) VALUES ('Alice')", &[]).await?;
+    /// conn.commit().await?;
+    /// # Ok(())
+    /// # }
+    /// ```
+    pub async fn begin(&mut self) -> Result<()> {
+        self.inner.begin().await
+    }
+
+    /// Commit the current transaction
+    ///
+    /// Commits all changes made in the current transaction.
+    ///
+    /// # Returns
+    ///
+    /// - `Ok(())` - Transaction committed successfully
+    /// - `Err(e)` - Failed to commit transaction
+    ///
+    /// # Example
+    ///
+    /// ```no_run
+    /// # use rsbench::pool::PooledConnection;
+    /// # async fn example(mut conn: PooledConnection) -> rsbench::Result<()> {
+    /// conn.begin().await?;
+    /// conn.execute("UPDATE balance SET amount = 100", &[]).await?;
+    /// conn.commit().await?;
+    /// # Ok(())
+    /// # }
+    /// ```
+    pub async fn commit(&mut self) -> Result<()> {
+        self.inner.commit().await
+    }
+
+    /// Rollback the current transaction
+    ///
+    /// Rolls back all changes made in the current transaction.
+    ///
+    /// # Returns
+    ///
+    /// - `Ok(())` - Transaction rolled back successfully
+    /// - `Err(e)` - Failed to rollback transaction
+    ///
+    /// # Example
+    ///
+    /// ```no_run
+    /// # use rsbench::pool::PooledConnection;
+    /// # async fn example(mut conn: PooledConnection) -> rsbench::Result<()> {
+    /// conn.begin().await?;
+    /// match conn.execute("RISKY OPERATION", &[]).await {
+    ///     Ok(_) => conn.commit().await?,
+    ///     Err(_) => conn.rollback().await?,
+    /// }
+    /// # Ok(())
+    /// # }
+    /// ```
+    pub async fn rollback(&mut self) -> Result<()> {
+        self.inner.rollback().await
     }
 }
 

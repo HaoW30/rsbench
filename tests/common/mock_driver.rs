@@ -43,7 +43,7 @@ impl DatabaseDriver for MockDriver {
         &self.name
     }
 
-    async fn connect(&self, _config: &ConnectionConfig) -> Result<Box<dyn Connection>> {
+    async fn connect(&self, _config: &ConnectionConfig) -> Result<Box<dyn Connection + Send>> {
         self.connect_count.fetch_add(1, Ordering::SeqCst);
 
         if self.should_fail {

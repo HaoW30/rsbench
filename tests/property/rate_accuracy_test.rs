@@ -108,6 +108,8 @@ proptest! {
                 new,
                 rate2
             );
+
+            Ok(())
         });
     }
 

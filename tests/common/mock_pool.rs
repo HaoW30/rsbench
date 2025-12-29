@@ -28,6 +28,9 @@ impl MockConnectionPool {
                 active_connections: 0,
                 idle_connections: 10,
                 pending_requests: 0,
+                total_checkouts: 0,
+                connection_errors: 0,
+                max_lifetime: Some(std::time::Duration::from_secs(600)),
             })),
         }
     }
@@ -125,6 +128,9 @@ mod tests {
             active_connections: 15,
             idle_connections: 5,
             pending_requests: 3,
+            total_checkouts: 100,
+            connection_errors: 2,
+            max_lifetime: Some(std::time::Duration::from_secs(600)),
         };
 
         let pool = MockConnectionPool::new().with_stats(custom_stats.clone());
@@ -145,6 +151,9 @@ mod tests {
             active_connections: 90,
             idle_connections: 10,
             pending_requests: 5,
+            total_checkouts: 500,
+            connection_errors: 10,
+            max_lifetime: Some(std::time::Duration::from_secs(1800)),
         };
 
         pool.set_stats(new_stats.clone());

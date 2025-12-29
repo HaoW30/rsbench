@@ -71,6 +71,10 @@ harness = false
 name = "rate_limiter_bench"
 harness = false
 
+[[bench]]
+name = "connection_pool_bench"
+harness = false
+
 [features]
 default = ["mysql"]
 mysql = ["mysql_async"]
