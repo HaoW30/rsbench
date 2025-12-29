@@ -77,6 +77,25 @@ impl ConfigLoader {
             return Err(Error::Config("Pool max_size must be greater than 0".into()));
         }
 
+        // Validate pool timeouts
+        if config.database.pool.connection_timeout.as_secs() == 0
+            && config.database.pool.connection_timeout.subsec_nanos() == 0 {
+            return Err(Error::Config("Pool connection_timeout must be greater than 0".into()));
+        }
+
+        if config.database.pool.idle_timeout.as_secs() == 0
+            && config.database.pool.idle_timeout.subsec_nanos() == 0 {
+            return Err(Error::Config("Pool idle_timeout must be greater than 0".into()));
+        }
+
+        // Warn if timeouts are unreasonably small (< 100ms)
+        if config.database.pool.connection_timeout.as_millis() < 100 {
+            eprintln!(
+                "Warning: Pool connection_timeout ({:?}) is very small, may cause frequent timeouts",
+                config.database.pool.connection_timeout
+            );
+        }
+
         // Validate connection string is not empty
         if config.database.connection_string.trim().is_empty() {
             return Err(Error::Config("Database connection string cannot be empty".into()));
@@ -1156,6 +1175,84 @@ output:
             .unwrap_err()
             .to_string()
             .contains("cannot exceed pool max_size"));
+    }
+
+    #[test]
+    fn test_validate_pool_connection_timeout_zero() {
+        let yaml = r#"
+database:
+  driver: mysql
+  connection_string: "mysql://localhost/test"
+  pool:
+    max_size: 10
+    connection_timeout: 0s
+
+runtime:
+  type: async
+  workers: 4
+  max_connections: 10
+  backpressure_threshold: 0.8
+
+scenario:
+  executor:
+    type: constant-rate
+    rate: 1000
+    duration: 60s
+    max_connections: 10
+  workload:
+    type: declarative
+    file: workloads/oltp_read_write.yaml
+
+output:
+  format: text
+"#;
+
+        let config = ConfigLoader::load(ConfigSource::Yaml(yaml.to_string())).unwrap();
+        let result = ConfigLoader::validate(&config);
+        assert!(result.is_err());
+        assert!(result
+            .unwrap_err()
+            .to_string()
+            .contains("connection_timeout must be greater than 0"));
+    }
+
+    #[test]
+    fn test_validate_pool_idle_timeout_zero() {
+        let yaml = r#"
+database:
+  driver: mysql
+  connection_string: "mysql://localhost/test"
+  pool:
+    max_size: 10
+    idle_timeout: 0s
+
+runtime:
+  type: async
+  workers: 4
+  max_connections: 10
+  backpressure_threshold: 0.8
+
+scenario:
+  executor:
+    type: constant-rate
+    rate: 1000
+    duration: 60s
+    max_connections: 10
+  workload:
+    type: declarative
+    file: workloads/oltp_read_write.yaml
+
+output:
+  format: text
+"#;
+
+        let config = ConfigLoader::load(ConfigSource::Yaml(yaml.to_string())).unwrap();
+        let result = ConfigLoader::validate(&config);
+        assert!(result.is_err());
+        assert!(result
+            .unwrap_err()
+            .to_string()
+            .contains("idle_timeout must be greater than 0"));
     }
 
     #[test]

@@ -14,7 +14,10 @@ use crate::config::PoolConfig;
 use crate::driver::DatabaseDriver;
 use crate::Result;
 use deadpool::managed::{Pool, PoolConfig as DeadpoolConfig};
+use deadpool::Runtime;
+use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::Arc;
+use std::time::Duration;
 
 /// Connection pool with real pooling via deadpool
 ///
@@ -126,19 +129,21 @@ impl ConnectionPool {
         let manager = DriverManager::new(driver, connection_string, config.connection_timeout);
 
         // Configure deadpool with our pool settings
-        // Note: Timeouts require a Tokio runtime to be available during pool creation
+        // Timeouts are now enabled with proper runtime specification
         let pool_config = DeadpoolConfig {
             max_size: config.max_size,
             timeouts: deadpool::managed::Timeouts {
-                wait: None,  // No wait timeout - will block until connection available
-                create: None,  // No create timeout
-                recycle: None,  // No recycle timeout
+                wait: Some(config.connection_timeout),
+                create: Some(config.connection_timeout),
+                recycle: Some(config.connection_timeout),
             },
             ..Default::default()
         };
 
         // Build the pool using deadpool 0.12 API
+        // Key: Must specify runtime for timeout support (see https://github.com/deadpool-rs/deadpool/issues/195)
         let inner = Pool::builder(manager)
+            .runtime(Runtime::Tokio1)  // Enable Tokio runtime for timeouts
             .config(pool_config)
             .build()
             .map_err(|e| {
@@ -149,6 +154,51 @@ impl ConnectionPool {
             })?;
 
         Ok(Self { inner, config })
+    }
+
+    /// Pre-warm the pool by creating min_size connections
+    ///
+    /// This method creates the minimum number of connections specified in the pool config,
+    /// ensuring they're ready for immediate use. This is useful to avoid cold-start latency
+    /// on first requests.
+    ///
+    /// # Returns
+    ///
+    /// - `Ok(())` - Successfully created min_size connections
+    /// - `Err(e)` - Failed to create connections
+    ///
+    /// # Example
+    ///
+    /// ```no_run
+    /// # use rsbench::pool::ConnectionPool;
+    /// # async fn example(pool: ConnectionPool) -> rsbench::Result<()> {
+    /// // Pre-warm the pool on startup
+    /// pool.warm_up().await?;
+    ///
+    /// // Now connections are ready for use
+    /// let conn = pool.get().await?;
+    /// # Ok(())
+    /// # }
+    /// ```
+    pub async fn warm_up(&self) -> Result<()> {
+        // Pre-create min_size connections by checking them out and immediately returning them
+        let mut connections = Vec::new();
+
+        for _ in 0..self.config.min_size {
+            match self.get().await {
+                Ok(conn) => connections.push(conn),
+                Err(e) => {
+                    // Failed to create a connection during warm-up
+                    // Drop any connections we did create and return the error
+                    return Err(e);
+                }
+            }
+        }
+
+        // Connections are automatically returned to the pool when dropped
+        drop(connections);
+
+        Ok(())
     }
 
     /// Get connection from pool
@@ -489,5 +539,160 @@ mod tests {
         // but hasn't created any yet (deadpool creates on demand)
         assert_eq!(stats.total_connections, 0);
         assert_eq!(stats.idle_connections, 0);
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn test_pool_warm_up() {
+        use crate::driver::{ConnectionConfig, DatabaseDriver, DriverCapabilities, QueryResult};
+        use std::sync::atomic::{AtomicUsize, Ordering};
+
+        // Track how many connections were created
+        let create_count = Arc::new(AtomicUsize::new(0));
+        let create_count_clone = create_count.clone();
+
+        struct TestDriver {
+            create_count: Arc<AtomicUsize>,
+        }
+
+        #[async_trait::async_trait]
+        impl DatabaseDriver for TestDriver {
+            fn name(&self) -> &str {
+                "test"
+            }
+
+            async fn connect(
+                &self,
+                _config: &ConnectionConfig,
+            ) -> Result<Box<dyn Connection + Send>> {
+                // Increment connection counter
+                self.create_count.fetch_add(1, Ordering::SeqCst);
+
+                // Create a test connection
+                Ok(Box::new(TestConnection))
+            }
+
+            fn capabilities(&self) -> DriverCapabilities {
+                DriverCapabilities {
+                    supports_transactions: true,
+                    supports_prepared_statements: true,
+                }
+            }
+        }
+
+        struct TestConnection;
+
+        #[async_trait::async_trait]
+        impl Connection for TestConnection {
+            async fn execute(
+                &mut self,
+                _sql: &str,
+                _params: &[crate::Value],
+            ) -> Result<QueryResult> {
+                Ok(QueryResult {
+                    rows_affected: 0,
+                    last_insert_id: None,
+                })
+            }
+
+            async fn begin(&mut self) -> Result<()> {
+                Ok(())
+            }
+
+            async fn commit(&mut self) -> Result<()> {
+                Ok(())
+            }
+
+            async fn rollback(&mut self) -> Result<()> {
+                Ok(())
+            }
+
+            async fn ping(&mut self) -> Result<()> {
+                Ok(())
+            }
+        }
+
+        let driver = Arc::new(TestDriver {
+            create_count: create_count_clone,
+        });
+
+        let config = PoolConfig {
+            min_size: 5,
+            max_size: 10,
+            connection_timeout: Duration::from_secs(5),
+            idle_timeout: Duration::from_secs(60),
+        };
+
+        let pool = ConnectionPool::new(driver, "test://localhost".to_string(), config).unwrap();
+
+        // Initially no connections
+        assert_eq!(pool.stats().total_connections, 0);
+        assert_eq!(create_count.load(Ordering::SeqCst), 0);
+
+        // Warm up the pool
+        pool.warm_up().await.unwrap();
+
+        // Should have created min_size connections
+        assert_eq!(create_count.load(Ordering::SeqCst), 5);
+
+        // After warm-up, pool should have connections
+        let stats = pool.stats();
+        assert_eq!(stats.total_connections, 5);
+        assert_eq!(stats.idle_connections, 5);
+        assert_eq!(stats.active_connections, 0);
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn test_pool_timeout_enforcement() {
+        use crate::driver::{ConnectionConfig, DatabaseDriver, DriverCapabilities};
+        use tokio::time::{sleep, Duration};
+
+        // Driver that takes a long time to connect
+        struct SlowDriver;
+
+        #[async_trait::async_trait]
+        impl DatabaseDriver for SlowDriver {
+            fn name(&self) -> &str {
+                "slow"
+            }
+
+            async fn connect(
+                &self,
+                _config: &ConnectionConfig,
+            ) -> Result<Box<dyn Connection + Send>> {
+                // Simulate slow connection (10 seconds)
+                sleep(Duration::from_secs(10)).await;
+                Err(crate::Error::Database(crate::DatabaseError::Connection(
+                    "Should timeout before this".to_string(),
+                )))
+            }
+
+            fn capabilities(&self) -> DriverCapabilities {
+                DriverCapabilities {
+                    supports_transactions: true,
+                    supports_prepared_statements: true,
+                }
+            }
+        }
+
+        let driver = Arc::new(SlowDriver);
+        let config = PoolConfig {
+            min_size: 1,
+            max_size: 10,
+            connection_timeout: Duration::from_millis(100), // Short timeout
+            idle_timeout: Duration::from_secs(60),
+        };
+
+        let pool = ConnectionPool::new(driver, "slow://localhost".to_string(), config).unwrap();
+
+        // Try to get a connection - should timeout
+        let start = tokio::time::Instant::now();
+        let result = pool.get().await;
+        let elapsed = start.elapsed();
+
+        // Should fail with timeout
+        assert!(result.is_err());
+
+        // Should timeout quickly (within 1 second), not wait for full 10 seconds
+        assert!(elapsed < Duration::from_secs(1), "Timeout took too long: {:?}", elapsed);
     }
 }
