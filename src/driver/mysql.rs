@@ -1,8 +1,21 @@
 //! MySQL driver implementation
+//!
+//! # Architecture Note
+//!
+//! This driver creates individual connections directly using `mysql_async::Conn::new()`.
+//! **Connection pooling is handled by the ConnectionPool module**, not by this driver.
+//! This design avoids double-pooling and maintains clear separation of concerns.
+//!
+//! # Connection String Format
+//!
+//! ```text
+//! mysql://user:password@host:port/database
+//! mysql://user:password@host:port/database?ssl-mode=required
+//! ```
 
 use super::{Connection, ConnectionConfig, DatabaseDriver, DriverCapabilities, QueryResult};
 use crate::{DatabaseError, Result, Value};
-use mysql_async::{prelude::*, Conn, Params, Pool};
+use mysql_async::{prelude::*, Conn, Params};
 
 /// MySQL driver implementation
 pub struct MySqlDriver;
@@ -23,9 +36,9 @@ impl DatabaseDriver for MySqlDriver {
         let opts = mysql_async::Opts::from_url(&config.connection_string)
             .map_err(|e| DatabaseError::Connection(e.to_string()))?;
 
-        let pool = Pool::new(opts);
-        let conn = pool
-            .get_conn()
+        // ✅ Create connection directly (no pool)
+        // This is the correct approach - pooling happens in ConnectionPool module
+        let conn = Conn::new(opts)
             .await
             .map_err(|e| DatabaseError::Connection(e.to_string()))?;
 
