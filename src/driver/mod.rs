@@ -8,6 +8,12 @@ mod mysql;
 #[cfg(feature = "mysql")]
 pub use mysql::MySqlDriver;
 
+#[cfg(feature = "postgres")]
+mod postgres;
+
+#[cfg(feature = "postgres")]
+pub use postgres::PostgresDriver;
+
 use crate::{DatabaseError, Result, Value};
 use std::collections::HashMap;
 use std::sync::Arc;
@@ -80,6 +86,9 @@ impl DriverRegistry {
         // Register built-in drivers
         #[cfg(feature = "mysql")]
         registry.register(Arc::new(MySqlDriver::new()));
+
+        #[cfg(feature = "postgres")]
+        registry.register(Arc::new(PostgresDriver::new()));
 
         registry
     }
@@ -183,6 +192,19 @@ mod tests {
         let driver = registry.get("mysql").unwrap();
 
         assert_eq!(driver.name(), "mysql");
+
+        let caps = driver.capabilities();
+        assert!(caps.supports_transactions);
+        assert!(caps.supports_prepared_statements);
+    }
+
+    #[test]
+    #[cfg(feature = "postgres")]
+    fn test_driver_registry_postgres() {
+        let registry = DriverRegistry::new();
+        let driver = registry.get("postgres").unwrap();
+
+        assert_eq!(driver.name(), "postgres");
 
         let caps = driver.capabilities();
         assert!(caps.supports_transactions);
