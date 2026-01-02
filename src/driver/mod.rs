@@ -210,4 +210,83 @@ mod tests {
         assert!(caps.supports_transactions);
         assert!(caps.supports_prepared_statements);
     }
+
+    // ========================================================================
+    // Cross-Driver Tests
+    // ========================================================================
+
+    #[test]
+    #[cfg(all(feature = "mysql", feature = "postgres"))]
+    fn test_driver_registry_both_drivers() {
+        let registry = DriverRegistry::new();
+
+        // Verify both drivers are registered
+        let mysql = registry.get("mysql");
+        let postgres = registry.get("postgres");
+
+        assert!(mysql.is_ok(), "MySQL driver should be registered");
+        assert!(postgres.is_ok(), "PostgreSQL driver should be registered");
+
+        // Verify they have correct names
+        assert_eq!(mysql.unwrap().name(), "mysql");
+        assert_eq!(postgres.unwrap().name(), "postgres");
+    }
+
+    #[test]
+    #[cfg(all(feature = "mysql", feature = "postgres"))]
+    fn test_driver_runtime_selection() {
+        let registry = DriverRegistry::new();
+
+        // Test runtime selection by name
+        let driver_names = vec!["mysql", "postgres"];
+
+        for name in driver_names {
+            let driver = registry.get(name);
+            assert!(driver.is_ok(), "Driver '{}' should be available", name);
+
+            let driver = driver.unwrap();
+            assert_eq!(driver.name(), name);
+
+            // Verify capabilities
+            let caps = driver.capabilities();
+            assert!(caps.supports_transactions);
+            assert!(caps.supports_prepared_statements);
+        }
+    }
+
+    #[test]
+    #[cfg(all(feature = "mysql", feature = "postgres"))]
+    fn test_driver_registry_independence() {
+        let registry = DriverRegistry::new();
+
+        // Get same driver multiple times
+        let mysql1 = registry.get("mysql").unwrap();
+        let mysql2 = registry.get("mysql").unwrap();
+        let postgres1 = registry.get("postgres").unwrap();
+        let postgres2 = registry.get("postgres").unwrap();
+
+        // Verify they are independent Arc clones
+        assert_eq!(mysql1.name(), mysql2.name());
+        assert_eq!(postgres1.name(), postgres2.name());
+        assert_ne!(mysql1.name(), postgres1.name());
+    }
+
+    #[test]
+    fn test_driver_registry_default_is_new() {
+        let registry1 = DriverRegistry::default();
+        let registry2 = DriverRegistry::new();
+
+        // Both should have the same drivers registered
+        #[cfg(feature = "mysql")]
+        {
+            assert!(registry1.get("mysql").is_ok());
+            assert!(registry2.get("mysql").is_ok());
+        }
+
+        #[cfg(feature = "postgres")]
+        {
+            assert!(registry1.get("postgres").is_ok());
+            assert!(registry2.get("postgres").is_ok());
+        }
+    }
 }

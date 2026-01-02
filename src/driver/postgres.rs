@@ -70,12 +70,20 @@ struct PostgresConnection {
 impl Connection for PostgresConnection {
     async fn execute(&mut self, sql: &str, params: &[Value]) -> Result<QueryResult> {
         // Convert RSBench Value types to PostgreSQL ToSql-compatible concrete types
-        // We use concrete types (i64, f64, String, Vec<u8>) instead of trait objects
+        // We use concrete types (i32, i64, f64, String, Vec<u8>) instead of trait objects
         // to avoid Send issues across await boundaries
         let converted_params: Vec<_> = params
             .iter()
             .map(|v| match v {
-                Value::Int(i) => ConvertedParam::Int(*i),
+                Value::Int(i) => {
+                    // PostgreSQL INT type is i32, BIGINT is i64
+                    // Use i32 if value fits, otherwise use i64
+                    if *i >= i32::MIN as i64 && *i <= i32::MAX as i64 {
+                        ConvertedParam::Int32(*i as i32)
+                    } else {
+                        ConvertedParam::Int64(*i)
+                    }
+                }
                 Value::Float(f) => ConvertedParam::Float(*f),
                 Value::String(s) => ConvertedParam::String(s.clone()),
                 Value::Bytes(b) => ConvertedParam::Bytes(b.clone()),
@@ -138,7 +146,8 @@ impl Connection for PostgresConnection {
 /// Helper enum to store converted parameter values
 /// Uses concrete types instead of trait objects to ensure Send safety
 enum ConvertedParam {
-    Int(i64),
+    Int32(i32),  // PostgreSQL INT is i32
+    Int64(i64),  // PostgreSQL BIGINT is i64
     Float(f64),
     String(String),
     Bytes(Vec<u8>),
@@ -148,11 +157,12 @@ enum ConvertedParam {
 impl ConvertedParam {
     fn as_tosql(&self) -> &(dyn ToSql + Sync) {
         match self {
-            ConvertedParam::Int(i) => i,
+            ConvertedParam::Int32(i) => i,
+            ConvertedParam::Int64(i) => i,
             ConvertedParam::Float(f) => f,
             ConvertedParam::String(s) => s,
             ConvertedParam::Bytes(b) => b,
-            ConvertedParam::Null => &Option::<i64>::None,
+            ConvertedParam::Null => &Option::<i32>::None,
         }
     }
 }
@@ -179,6 +189,7 @@ mod tests {
     fn test_postgres_parameter_conversion() {
         let params = vec![
             Value::Int(42),
+            Value::Int(i64::MAX), // Test large int -> BIGINT
             Value::Float(3.14),
             Value::String("test".into()),
             Value::Bytes(vec![1, 2, 3]),
@@ -188,7 +199,13 @@ mod tests {
         let converted: Vec<_> = params
             .iter()
             .map(|v| match v {
-                Value::Int(i) => ConvertedParam::Int(*i),
+                Value::Int(i) => {
+                    if *i >= i32::MIN as i64 && *i <= i32::MAX as i64 {
+                        ConvertedParam::Int32(*i as i32)
+                    } else {
+                        ConvertedParam::Int64(*i)
+                    }
+                }
                 Value::Float(f) => ConvertedParam::Float(*f),
                 Value::String(s) => ConvertedParam::String(s.clone()),
                 Value::Bytes(b) => ConvertedParam::Bytes(b.clone()),
@@ -196,11 +213,22 @@ mod tests {
             })
             .collect();
 
-        assert_eq!(converted.len(), 5);
+        assert_eq!(converted.len(), 6);
 
         // Test that as_tosql() works
         for param in &converted {
             let _ = param.as_tosql();
+        }
+
+        // Verify correct type selection
+        match &converted[0] {
+            ConvertedParam::Int32(i) => assert_eq!(*i, 42),
+            _ => panic!("Expected Int32"),
+        }
+
+        match &converted[1] {
+            ConvertedParam::Int64(i) => assert_eq!(*i, i64::MAX),
+            _ => panic!("Expected Int64"),
         }
     }
 }
