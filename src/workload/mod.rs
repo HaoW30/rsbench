@@ -18,9 +18,10 @@ use std::path::Path;
 use std::time::Duration;
 
 /// Workload trait - all workload types implement this
+#[async_trait::async_trait]
 pub trait Workload: Send + Sync {
     /// Prepare workload (create tables, load data)
-    fn prepare(&mut self, ctx: &mut PrepareContext) -> Result<()>;
+    async fn prepare(&mut self, ctx: &mut PrepareContext<'_>) -> Result<()>;
 
     /// Generate next operation (deterministic)
     fn next_operation(&mut self, ctx: &ExecutionContext) -> Result<Operation>;
@@ -35,18 +36,13 @@ pub trait Workload: Send + Sync {
 /// Context for preparation phase
 pub struct PrepareContext<'a> {
     /// Database connection for setup
-    pub database: &'a mut dyn PrepareDatabase,
+    pub connection: &'a mut dyn crate::driver::Connection,
 
     /// Determinism seed
     pub seed: u64,
 
     /// Number of workers
     pub worker_count: usize,
-}
-
-/// Database operations available during prepare
-pub trait PrepareDatabase {
-    fn execute(&mut self, sql: &str) -> Result<()>;
 }
 
 /// Context for operation execution

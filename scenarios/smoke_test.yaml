@@ -3,6 +3,9 @@
 # Quick sanity check to verify database connectivity and basic functionality.
 # Runs for a short duration with low load.
 
+# Infrastructure config reference (database, pool, runtime settings)
+config: ../config/rsbench.config.yaml
+
 scenario:
   executor:
     type: constant-rate

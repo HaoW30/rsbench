@@ -3,6 +3,9 @@
 # Tests database performance at high request rates.
 # Used to find maximum sustainable throughput.
 
+# Infrastructure configuration
+config: ../config/rsbench.config.yaml
+
 scenario:
   executor:
     type: constant-rate

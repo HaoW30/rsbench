@@ -340,7 +340,8 @@ impl ScenarioExecutor {
                 RateLimiter::new(initial_rate)
             }
             // ClosedLoop doesn't use rate limiting (workers drive the rate)
-            ExecutorConfig::ClosedLoop { .. } => RateLimiter::new(u64::MAX),
+            // Use u64::MAX/2 to avoid overflow in rate*2 calculation
+            ExecutorConfig::ClosedLoop { .. } => RateLimiter::new(u64::MAX / 2),
         };
 
         Self {
@@ -608,6 +609,18 @@ impl ScenarioExecutor {
         // Collect results
         let actual_end = Instant::now();
         let metrics_snapshot = self.metrics.snapshot();
+
+        // Calculate completed operations from metrics
+        let completed_count: u64 = metrics_snapshot.operation_metrics.values()
+            .map(|op_stats| op_stats.count)
+            .sum();
+
+        eprintln!("\n[Scenario] Operation tracking:");
+        eprintln!("  Generated (submitted): {}", iteration);
+        eprintln!("  Completed (from metrics): {}", completed_count);
+        eprintln!("  In-flight (difference): {}", iteration.saturating_sub(completed_count));
+        eprintln!("  Backpressure events: {}\n", metrics_snapshot.backpressure_events);
+
         Ok(ScenarioResult {
             duration: start.elapsed(),
             operations_completed: iteration,
@@ -685,6 +698,18 @@ impl ScenarioExecutor {
         // Collect results
         let actual_end = Instant::now();
         let metrics_snapshot = self.metrics.snapshot();
+
+        // Calculate completed operations from metrics
+        let completed_count: u64 = metrics_snapshot.operation_metrics.values()
+            .map(|op_stats| op_stats.count)
+            .sum();
+
+        eprintln!("\n[Scenario] Operation tracking:");
+        eprintln!("  Generated (submitted): {}", iteration);
+        eprintln!("  Completed (from metrics): {}", completed_count);
+        eprintln!("  In-flight (difference): {}", iteration.saturating_sub(completed_count));
+        eprintln!("  Backpressure events: {}\n", metrics_snapshot.backpressure_events);
+
         Ok(ScenarioResult {
             duration: start.elapsed(),
             operations_completed: iteration,
@@ -1055,6 +1080,8 @@ mod tests {
         let metrics_snapshot = MetricsSnapshot {
             operation_metrics: HashMap::new(),
             backpressure_events: 0,
+            pool_saturation_events: 0,
+            runtime_saturation_events: 0,
             duration: Duration::from_secs(10),
             timestamp: std::time::SystemTime::now(),
         };
@@ -1096,6 +1123,8 @@ mod tests {
         let metrics_snapshot = MetricsSnapshot {
             operation_metrics,
             backpressure_events: 0,
+            pool_saturation_events: 0,
+            runtime_saturation_events: 0,
             duration: Duration::from_secs(10),
             timestamp: std::time::SystemTime::now(),
         };
@@ -1126,6 +1155,8 @@ mod tests {
         let metrics_snapshot = MetricsSnapshot {
             operation_metrics: HashMap::new(),
             backpressure_events: 10,
+            pool_saturation_events: 0,
+            runtime_saturation_events: 0,
             duration: Duration::from_secs(60),
             timestamp: std::time::SystemTime::now(),
         };
@@ -1166,6 +1197,8 @@ mod tests {
         let metrics_snapshot = MetricsSnapshot {
             operation_metrics: HashMap::new(),
             backpressure_events: 0,
+            pool_saturation_events: 0,
+            runtime_saturation_events: 0,
             duration: Duration::from_secs(1),
             timestamp: std::time::SystemTime::now(),
         };
@@ -1197,6 +1230,8 @@ mod tests {
         let metrics_snapshot = MetricsSnapshot {
             operation_metrics: HashMap::new(),
             backpressure_events: 0,
+            pool_saturation_events: 0,
+            runtime_saturation_events: 0,
             duration: Duration::from_secs(30),
             timestamp: std::time::SystemTime::now(),
         };
@@ -1219,8 +1254,9 @@ mod tests {
     // Mock workload for testing
     struct MockWorkload;
 
+    #[async_trait::async_trait]
     impl crate::workload::Workload for MockWorkload {
-        fn prepare(&mut self, _ctx: &mut crate::workload::PrepareContext) -> Result<()> {
+        async fn prepare(&mut self, _ctx: &mut crate::workload::PrepareContext<'_>) -> Result<()> {
             Ok(())
         }
 
@@ -1834,8 +1870,9 @@ operations:
 
         // Create a workload that fails
         struct FailingWorkload;
+        #[async_trait::async_trait]
         impl crate::workload::Workload for FailingWorkload {
-            fn prepare(&mut self, _ctx: &mut crate::workload::PrepareContext) -> Result<()> {
+            async fn prepare(&mut self, _ctx: &mut crate::workload::PrepareContext<'_>) -> Result<()> {
                 Ok(())
             }
 

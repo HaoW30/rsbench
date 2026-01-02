@@ -1,0 +1,24 @@
+# TiDB 100K QPS Infrastructure Config
+#
+# High-throughput configuration for TiDB testing at 100K QPS
+# Optimized for extreme load with large connection pools
+
+database:
+  driver: mysql
+  connection_string: "mysql://root:@localhost:4000/test"
+
+  pool:
+    min_size: 20
+    max_size: 200         # High connection pool for extreme throughput
+    connection_timeout: 5s
+    idle_timeout: 300s
+
+runtime:
+  type: async
+  workers: 8              # Use all CPU cores
+  max_connections: 200    # High concurrency
+  backpressure_threshold: 0.8
+
+output:
+  format: text
+  file: null

@@ -2,48 +2,95 @@
 
 This directory contains test scenario definitions for RSBench.
 
+## Quick Start
+
+**Run a scenario** (recommended way):
+```bash
+rsbench --scenario scenarios/smoke_test.yaml run
+```
+
+The scenario file is the **entry point** - it references infrastructure config and workload.
+
 ## Purpose
 
-Test scenarios define **what to test**:
-- Workload type and parameters
+Scenarios define **what test to run**:
+- Which infrastructure config to use (database, pool, runtime)
+- Which workload to execute (operations, SQL queries)
 - Load pattern (rate, duration, ramping)
-- Test-specific settings
+- Test-specific settings (seed, output)
 
-They are separate from infrastructure configuration (database connection, runtime settings), which is defined in `config/`.
+## Architecture
 
-## Usage
-
-### Run with Default Infrastructure Config
-
-```bash
-rsbench --scenario scenarios/oltp_read_write.yaml
+```
+Scenario File (Entry Point)
+  ├─> references Config (infrastructure)
+  └─> references Workload (operations)
 ```
 
-This uses `config/rsbench.config.yaml` by default.
-
-### Run with Specific Infrastructure Config
-
-```bash
-rsbench --config config/rsbench.config.staging.yaml --scenario scenarios/oltp_read_write.yaml
-```
-
-### Override Config in Scenario File
-
-You can specify a config file directly in the scenario:
-
+Example scenario structure:
 ```yaml
 # scenarios/my_test.yaml
-config: config/rsbench.config.staging.yaml
+config: ../config/local.yaml        # Infrastructure (database, pool, runtime)
 
 scenario:
   executor:
     type: constant-rate
     rate: 1000
     duration: 60s
+
   workload:
-    type: builtin
-    name: oltp_read_write
+    type: declarative
+    file: ../workloads/oltp.yaml    # Operations (SQL, parameters)
+
+determinism:
+  seed: 42
 ```
+
+## Usage Patterns
+
+### Pattern 1: Scenario References Config (Recommended)
+
+```bash
+rsbench --scenario scenarios/smoke_test.yaml run
+```
+
+✅ **Self-contained**: Scenario specifies everything
+✅ **Portable**: Easy to share and version control
+✅ **Clear**: Config path is explicit
+
+### Pattern 2: Override Config via CLI
+
+Test same scenario against different environments:
+
+```bash
+# Development
+rsbench --scenario scenarios/smoke_test.yaml run
+# (uses config from scenario file)
+
+# Staging
+rsbench --config config/staging.yaml --scenario scenarios/smoke_test.yaml run
+
+# Production
+rsbench --config config/prod.yaml --scenario scenarios/smoke_test.yaml run
+```
+
+✅ **Flexible**: Same test, different environments
+
+### Pattern 3: Default Config
+
+If scenario doesn't specify a config:
+
+```bash
+rsbench --scenario scenarios/my_test.yaml run
+```
+
+Uses `config/rsbench.config.yaml` by default.
+
+## Config Resolution Priority
+
+1. **CLI `--config` flag** (highest priority)
+2. **Scenario's `config` field**
+3. **Default `config/rsbench.config.yaml`** (lowest priority)
 
 ## Available Scenarios
 

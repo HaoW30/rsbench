@@ -1,0 +1,23 @@
+# MySQL on Port 4000 - Infrastructure Configuration
+#
+# Custom config for MySQL instance running on port 4000
+
+database:
+  driver: mysql
+  connection_string: "mysql://root:@localhost:4000/test"
+
+  pool:
+    min_size: 50
+    max_size: 800         # High connection pool for 100K QPS
+    connection_timeout: 5s
+    idle_timeout: 300s
+
+runtime:
+  type: async
+  workers: 8              # Use all available CPU cores
+  max_connections: 1000   # High concurrency for 100K QPS
+  backpressure_threshold: 0.8
+
+output:
+  format: text
+  file: null              # Output to stdout

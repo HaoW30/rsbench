@@ -280,6 +280,9 @@ impl DeclarativeWorkload {
             ));
         }
 
+        // Validate parameters and distributions
+        Self::validate_workload(&spec)?;
+
         // Build weighted index for operation selection
         let weights: Vec<u32> = spec.operations.iter().map(|op| op.weight).collect();
         let operation_weights = WeightedIndex::new(weights).map_err(|e| {
@@ -308,6 +311,104 @@ impl DeclarativeWorkload {
             variables,
             created_tables: Vec::new(),
         })
+    }
+
+    /// Validate workload specification
+    fn validate_workload(spec: &WorkloadSpec) -> Result<()> {
+        // Supported distribution types
+        const VALID_DISTRIBUTIONS: &[&str] = &[
+            "uniform",
+            "round_robin",
+            "sequential",
+            "zipfian",
+            "zipf",
+            "gaussian",
+            "normal",
+        ];
+
+        // Supported generator types
+        const VALID_GENERATORS: &[&str] = &[
+            "string",
+            "integer",
+            "decimal",
+            "float",
+            "choice",
+            "uuid",
+            "timestamp",
+            "custom",
+        ];
+
+        // Validate each operation
+        for op in &spec.operations {
+            // Validate parameters
+            for param in &op.parameters {
+                // Bug Fix #1: Parameter must have distribution or generator
+                if param.distribution.is_none() && param.generator.is_none() {
+                    return Err(crate::Error::Workload(format!(
+                        "Parameter '{}' in operation '{}' must have either 'distribution' or 'generator'",
+                        param.name, op.name
+                    )));
+                }
+
+                // Bug Fix #2: Validate distribution type
+                if let Some(ref dist) = param.distribution {
+                    if !VALID_DISTRIBUTIONS.contains(&dist.distribution_type.as_str()) {
+                        return Err(crate::Error::Workload(format!(
+                            "Invalid distribution type '{}' for parameter '{}' in operation '{}'. Valid types: {}",
+                            dist.distribution_type,
+                            param.name,
+                            op.name,
+                            VALID_DISTRIBUTIONS.join(", ")
+                        )));
+                    }
+
+                    // Bug Fix #3: Validate range values (min <= max)
+                    if let Some(ref range) = dist.range {
+                        // Parse range values (handles variable substitution)
+                        if let Ok(min) = range[0].parse::<i64>() {
+                            if let Ok(max) = range[1].parse::<i64>() {
+                                if min > max {
+                                    return Err(crate::Error::Workload(format!(
+                                        "Invalid range for parameter '{}' in operation '{}': min ({}) > max ({})",
+                                        param.name, op.name, min, max
+                                    )));
+                                }
+                            }
+                        }
+                        // If values contain variables (${...}), skip validation - will be checked at runtime
+                    }
+                }
+
+                // Validate generator type
+                if let Some(ref gen) = param.generator {
+                    if !VALID_GENERATORS.contains(&gen.generator_type.as_str()) {
+                        return Err(crate::Error::Workload(format!(
+                            "Invalid generator type '{}' for parameter '{}' in operation '{}'. Valid types: {}",
+                            gen.generator_type,
+                            param.name,
+                            op.name,
+                            VALID_GENERATORS.join(", ")
+                        )));
+                    }
+
+                    // Validate generator range values (min <= max)
+                    if let Some(ref range) = gen.range {
+                        if let Ok(min) = range[0].parse::<i64>() {
+                            if let Ok(max) = range[1].parse::<i64>() {
+                                if min > max {
+                                    return Err(crate::Error::Workload(format!(
+                                        "Invalid range for parameter '{}' in operation '{}': min ({}) > max ({})",
+                                        param.name, op.name, min, max
+                                    )));
+                                }
+                            }
+                        }
+                    }
+                }
+            }
+        }
+
+        Ok(())
     }
 
     /// Apply overrides to workload specification
@@ -662,9 +763,9 @@ impl DeclarativeWorkload {
     }
 
     /// Load data into a table based on data generation configuration
-    fn load_table_data(
+    async fn load_table_data(
         &mut self,
-        ctx: &mut PrepareContext,
+        ctx: &mut PrepareContext<'_>,
         table_name: &str,
         table_def: &TableDefinition,
     ) -> Result<()> {
@@ -736,7 +837,7 @@ impl DeclarativeWorkload {
             insert_sql.push_str(&value_sets.join(", "));
 
             // Execute batch INSERT
-            ctx.database.execute(&insert_sql)?;
+            ctx.connection.execute(&insert_sql, &[]).await?;
         }
 
         Ok(())
@@ -871,8 +972,9 @@ impl DeclarativeWorkload {
     }
 }
 
+#[async_trait::async_trait]
 impl Workload for DeclarativeWorkload {
-    fn prepare(&mut self, ctx: &mut PrepareContext) -> Result<()> {
+    async fn prepare(&mut self, ctx: &mut PrepareContext<'_>) -> Result<()> {
         // Clone table definitions to avoid borrow checker issues
         let table_defs = self.spec.schema.tables.clone();
 
@@ -926,7 +1028,7 @@ impl Workload for DeclarativeWorkload {
                 create_sql.push(')');
 
                 // Execute CREATE TABLE
-                ctx.database.execute(&create_sql)?;
+                ctx.connection.execute(&create_sql, &[]).await?;
 
                 // Track created table for cleanup
                 self.created_tables.push(table_name.clone());
@@ -937,11 +1039,11 @@ impl Workload for DeclarativeWorkload {
                         "CREATE INDEX {} ON {} ({})",
                         index_name, table_name, col_name
                     );
-                    ctx.database.execute(&index_sql)?;
+                    ctx.connection.execute(&index_sql, &[]).await?;
                 }
 
                 // Load data based on data_generation config
-                self.load_table_data(ctx, &table_name, table_def)?;
+                self.load_table_data(ctx, &table_name, table_def).await?;
             }
         }
 
@@ -970,13 +1072,13 @@ impl Workload for DeclarativeWorkload {
 
             for sub_op in tx_ops {
                 // Generate parameters for this sub-operation
-                let mut sub_params = Vec::new();
+                let mut all_sub_params = Vec::new();
                 let mut named_params: Vec<(String, Value)> = Vec::new();
 
                 for param_def in &sub_op.parameters {
                     let value = self.generate_parameter(param_def, ctx)?;
                     named_params.push((param_def.name.clone(), value.clone()));
-                    sub_params.push(value);
+                    all_sub_params.push((param_def.name.clone(), value));
                 }
 
                 // Build SQL with named parameter substitutions
@@ -984,6 +1086,15 @@ impl Workload for DeclarativeWorkload {
                     .map(|(name, value)| (name.as_str(), value))
                     .collect();
                 let sql = self.build_sql(&sub_op.sql, &param_refs);
+
+                // Only include parameters that match SQL placeholders (?)
+                let placeholder_count = sql.matches('?').count();
+                let sub_params: Vec<Value> = all_sub_params.iter()
+                    .rev()
+                    .take(placeholder_count)
+                    .map(|(_, v)| v.clone())
+                    .rev()
+                    .collect();
 
                 transaction_sqls.push(sql);
                 transaction_params.push(sub_params);
@@ -1001,20 +1112,34 @@ impl Workload for DeclarativeWorkload {
         } else {
             // Single operation (non-transaction)
             // Generate parameters
-            let mut params = Vec::new();
+            let mut all_params = Vec::new();
             let mut named_params: Vec<(String, Value)> = Vec::new();
 
             for param_def in &op_def.parameters {
                 let value = self.generate_parameter(param_def, ctx)?;
                 named_params.push((param_def.name.clone(), value.clone()));
-                params.push(value);
+                all_params.push((param_def.name.clone(), value));
             }
 
-            // Build SQL with named parameter substitutions
+            // Build SQL with named parameter substitutions (for {table_id}, etc.)
             let param_refs: Vec<(&str, &Value)> = named_params.iter()
                 .map(|(name, value)| (name.as_str(), value))
                 .collect();
             let sql = self.build_sql(&op_def.sql, &param_refs);
+
+            // IMPORTANT: Only include parameters that are actual SQL placeholders (?),
+            // not template substitutions ({table_id})
+            // Count the number of ? in the final SQL
+            let placeholder_count = sql.matches('?').count();
+
+            // Only pass the LAST N parameters where N = number of ? placeholders
+            // Template parameters like {table_id} are at the beginning, SQL params at the end
+            let params: Vec<Value> = all_params.iter()
+                .rev()  // Reverse to get last N params
+                .take(placeholder_count)
+                .map(|(_, v)| v.clone())
+                .rev()  // Reverse back to original order
+                .collect();
 
             Ok(Operation {
                 name: op_def.name,
@@ -1200,12 +1325,16 @@ workload:
     - name: select
       weight: 100
       type: read
-      sql: "SELECT * FROM test{table_id}"
+      sql: "SELECT * FROM test{table_id} WHERE id = ?"
       parameters:
         - name: table_id
           distribution:
             type: round_robin
             range: [1, 5]
+        - name: id
+          distribution:
+            type: uniform
+            range: [1, 100]
 "#;
 
         let mut workload = DeclarativeWorkload::from_yaml(yaml, 42).unwrap();
@@ -1215,20 +1344,32 @@ workload:
             elapsed: std::time::Duration::from_secs(0),
         };
 
-        // Generate multiple operations and check round-robin behavior
-        let mut values = Vec::new();
+        // Generate multiple operations and check round-robin behavior in SQL
+        // Note: {table_id} gets substituted into SQL, not passed as parameter
+        let mut table_nums = Vec::new();
         for _ in 0..10 {
             let op = workload.next_operation(&ctx).unwrap();
-            if let Value::Int(val) = op.params[0] {
-                values.push(val);
+            // Extract table number from SQL (e.g., "SELECT * FROM test3 WHERE id = ?")
+            let sql = &op.sql;
+            if let Some(start) = sql.find("test") {
+                let table_part = &sql[start + 4..]; // Skip "test"
+                if let Some(end) = table_part.find(|c: char| !c.is_numeric()) {
+                    if let Ok(num) = table_part[..end].parse::<i64>() {
+                        table_nums.push(num);
+                    }
+                }
             }
+
+            // Also verify that SQL parameter (id) is present
+            assert_eq!(op.params.len(), 1, "Should have 1 SQL parameter (id)");
         }
 
         // Should cycle through 1,2,3,4,5,1,2,3,4,5
-        assert_eq!(values[0], 1);
-        assert_eq!(values[1], 2);
-        assert_eq!(values[4], 5);
-        assert_eq!(values[5], 1);
+        assert_eq!(table_nums.len(), 10);
+        assert_eq!(table_nums[0], 1);
+        assert_eq!(table_nums[1], 2);
+        assert_eq!(table_nums[4], 5);
+        assert_eq!(table_nums[5], 1); // Cycles back to 1
     }
 
     #[test]

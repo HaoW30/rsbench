@@ -56,8 +56,9 @@ impl MockWorkload {
     }
 }
 
+#[async_trait::async_trait]
 impl Workload for MockWorkload {
-    fn prepare(&mut self, _ctx: &mut PrepareContext) -> Result<()> {
+    async fn prepare(&mut self, _ctx: &mut PrepareContext<'_>) -> Result<()> {
         self.prepare_called = true;
         Ok(())
     }

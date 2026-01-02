@@ -4,7 +4,7 @@
 # It runs a balanced read/write workload at a modest rate for a short duration.
 #
 # Usage:
-#   rsbench --config config/rsbench.config.yaml --scenario scenarios/quickstart.yaml
+#   rsbench --scenario scenarios/quickstart.yaml run
 #
 # What this does:
 #   - Runs at 100 operations per second (gentle load)
@@ -15,6 +15,9 @@
 #   - Increase rate for load testing: see scenarios/high_throughput.yaml
 #   - Run capacity test: see scenarios/capacity_test.yaml
 #   - Customize workload: see workloads/README.md
+
+# Infrastructure configuration
+config: ../config/rsbench.config.yaml
 
 scenario:
   executor:

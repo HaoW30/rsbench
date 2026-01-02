@@ -3,6 +3,9 @@
 # Gradually increases load to find the database capacity limits.
 # Watch for when backpressure events start occurring and latency degrades.
 
+# Infrastructure configuration
+config: ../config/rsbench.config.yaml
+
 scenario:
   executor:
     type: ramping-rate

@@ -16,8 +16,9 @@ use tokio::sync::mpsc;
 
 struct TestWorkload;
 
+#[async_trait::async_trait]
 impl Workload for TestWorkload {
-    fn prepare(&mut self, _ctx: &mut PrepareContext) -> Result<()> {
+    async fn prepare(&mut self, _ctx: &mut PrepareContext<'_>) -> Result<()> {
         Ok(())
     }
 

@@ -181,6 +181,8 @@ mod tests {
         MetricsSnapshot {
             operation_metrics,
             backpressure_events: 0,
+            pool_saturation_events: 0,
+            runtime_saturation_events: 0,
             duration: Duration::from_secs(10),
             timestamp: std::time::SystemTime::now(),
         }

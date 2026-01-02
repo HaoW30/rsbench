@@ -1,0 +1,41 @@
+# Combined Config for MySQL 10K QPS Test with 20 Connections
+# Has both infrastructure and scenario settings
+
+database:
+  driver: mysql
+  connection_string: "mysql://root@127.0.0.1:4000/test"
+  pool:
+    min_size: 50         # Pre-create ALL connections (same as max_size)
+    max_size: 50         # 50 connections max
+    connection_timeout: 5s
+    idle_timeout: 300s
+
+runtime:
+  type: async
+  workers: 8
+  max_connections: 50   # Match pool.max_size exactly
+  backpressure_threshold: 0.8
+
+scenario:
+  executor:
+    type: constant-rate
+    rate: 10000         # Target: 10K ops/sec
+    duration: 15s       # Short test to diagnose health check
+    max_connections: 50  # 50 concurrent operations
+
+  workload:
+    type: declarative
+    file: workloads/oltp_point_select.yaml
+    overrides:
+      schema:
+        tables:
+          - count: 10
+            row_count: 100000
+
+determinism:
+  seed: 42
+  strict_mode: false
+
+output:
+  format: text
+  file: null

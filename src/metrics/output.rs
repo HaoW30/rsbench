@@ -27,15 +27,38 @@ impl MetricsOutput for TextOutput {
         writeln!(self.writer)?;
 
         for (op_name, metrics) in &snapshot.operation_metrics {
+            let error_rate = metrics.error_rate() * 100.0;
+            let success_rate = metrics.success_rate() * 100.0;
+
             writeln!(self.writer, "Operation: {}", op_name)?;
             writeln!(self.writer, "  Count: {}", metrics.count)?;
-            writeln!(self.writer, "  Errors: {}", metrics.errors)?;
+            writeln!(
+                self.writer,
+                "  Errors: {} ({:.2}%)",
+                metrics.errors, error_rate
+            )?;
+            writeln!(self.writer, "  Success Rate: {:.2}%", success_rate)?;
             writeln!(
                 self.writer,
                 "  Throughput: {:.2} ops/sec",
                 metrics.throughput(snapshot.duration)
             )?;
             writeln!(self.writer, "  Latency:")?;
+            writeln!(
+                self.writer,
+                "    min: {} μs",
+                metrics.latency_histogram.min()
+            )?;
+            writeln!(
+                self.writer,
+                "    max: {} μs",
+                metrics.latency_histogram.max()
+            )?;
+            writeln!(
+                self.writer,
+                "    mean: {:.2} μs",
+                metrics.latency_histogram.mean()
+            )?;
             writeln!(
                 self.writer,
                 "    p50: {} μs",
@@ -51,14 +74,59 @@ impl MetricsOutput for TextOutput {
                 "    p99: {} μs",
                 metrics.latency_histogram.value_at_quantile(0.99)
             )?;
+            writeln!(
+                self.writer,
+                "    p999: {} μs",
+                metrics.latency_histogram.value_at_quantile(0.999)
+            )?;
+
+            // Warning for high error rate
+            if error_rate > 1.0 {
+                writeln!(self.writer)?;
+                writeln!(
+                    self.writer,
+                    "  ⚠️  Warning: Error rate ({:.2}%) exceeds recommended threshold (1.0%)",
+                    error_rate
+                )?;
+            }
+
             writeln!(self.writer)?;
         }
 
+        writeln!(self.writer, "Client Metrics:")?;
         writeln!(
             self.writer,
-            "Backpressure events: {}",
+            "  Backpressure events: {}",
             snapshot.backpressure_events
         )?;
+        writeln!(
+            self.writer,
+            "  Pool saturation events: {}",
+            snapshot.pool_saturation_events
+        )?;
+        writeln!(
+            self.writer,
+            "  Runtime saturation events: {}",
+            snapshot.runtime_saturation_events
+        )?;
+
+        // Warning for high backpressure
+        let total_ops: u64 = snapshot.operation_metrics.values().map(|m| m.count).sum();
+        if total_ops > 0 {
+            let backpressure_rate = snapshot.backpressure_events as f64 / total_ops as f64 * 100.0;
+            if backpressure_rate > 5.0 {
+                writeln!(self.writer)?;
+                writeln!(
+                    self.writer,
+                    "⚠️  Warning: High backpressure rate ({:.2}%) - client may be saturated",
+                    backpressure_rate
+                )?;
+                writeln!(
+                    self.writer,
+                    "    Consider increasing max_connections or reducing target rate"
+                )?;
+            }
+        }
 
         Ok(())
     }
@@ -87,6 +155,7 @@ impl MetricsOutput for JsonOutput {
                 json!({
                     "count": metrics.count,
                     "errors": metrics.errors,
+                    "error_rate": metrics.error_rate(),
                     "success_rate": metrics.success_rate(),
                     "throughput": metrics.throughput(snapshot.duration),
                     "latency": {
@@ -108,6 +177,8 @@ impl MetricsOutput for JsonOutput {
             "operations": operations,
             "client_metrics": {
                 "backpressure_events": snapshot.backpressure_events,
+                "pool_saturation_events": snapshot.pool_saturation_events,
+                "runtime_saturation_events": snapshot.runtime_saturation_events,
             }
         });
 
@@ -145,6 +216,8 @@ mod tests {
         MetricsSnapshot {
             operation_metrics,
             backpressure_events: 3,
+            pool_saturation_events: 2,
+            runtime_saturation_events: 1,
             duration: Duration::from_secs(10),
             timestamp: SystemTime::now(),
         }
@@ -175,6 +248,8 @@ mod tests {
         let snapshot = MetricsSnapshot {
             operation_metrics: HashMap::new(),
             backpressure_events: 0,
+            pool_saturation_events: 0,
+            runtime_saturation_events: 0,
             duration: Duration::from_secs(1),
             timestamp: SystemTime::now(),
         };
@@ -191,6 +266,8 @@ mod tests {
         let snapshot = MetricsSnapshot {
             operation_metrics: HashMap::new(),
             backpressure_events: 0,
+            pool_saturation_events: 0,
+            runtime_saturation_events: 0,
             duration: Duration::from_secs(1),
             timestamp: SystemTime::now(),
         };

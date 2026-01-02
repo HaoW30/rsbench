@@ -59,20 +59,20 @@ impl Cli {
     /// Load complete configuration from CLI arguments
     ///
     /// This method:
-    /// 1. Loads infrastructure config (from --config or default)
-    /// 2. Loads scenario file (from --scenario or error if not provided)
+    /// 1. Loads scenario file (from --scenario or error if not provided)
+    /// 2. Loads infrastructure config (from scenario.config, --config, or default)
     /// 3. Merges them into a complete ToolConfig
     /// 4. Applies CLI argument overrides
     /// 5. Validates the final configuration
     pub fn load_config(&self) -> Result<ToolConfig> {
-        // Determine infrastructure config path
-        let infra_path = self.get_config_path();
+        // Load scenario file first to check if it references a config
+        let scenario_file = self.load_scenario_file()?;
+
+        // Determine infrastructure config path (priority: scenario.config > CLI --config > default)
+        let infra_path = self.resolve_config_path(&scenario_file)?;
 
         // Load infrastructure config
         let infra_config = ConfigLoader::load_infrastructure(ConfigSource::File(infra_path))?;
-
-        // Load scenario file
-        let scenario_file = self.load_scenario_file()?;
 
         // Merge infrastructure and scenario
         let mut config =
@@ -90,6 +90,61 @@ impl Cli {
         ConfigLoader::validate(&config)?;
 
         Ok(config)
+    }
+
+    /// Resolve infrastructure config path with priority:
+    /// 1. Scenario file's `config` field (if specified)
+    /// 2. CLI --config argument (if specified)
+    /// 3. Default config file path
+    fn resolve_config_path(&self, scenario_file: &ScenarioFile) -> Result<PathBuf> {
+        // Priority 1: Scenario file references a config
+        if let Some(ref config_path) = scenario_file.config {
+            // Make relative paths relative to scenario file's directory
+            let resolved = if config_path.is_relative() {
+                if let Some(scenario_path) = &self.scenario {
+                    if let Some(scenario_dir) = scenario_path.parent() {
+                        scenario_dir.join(config_path)
+                    } else {
+                        config_path.clone()
+                    }
+                } else {
+                    config_path.clone()
+                }
+            } else {
+                config_path.clone()
+            };
+
+            if !resolved.exists() {
+                return Err(Error::Config(format!(
+                    "Config file referenced by scenario not found: {}",
+                    resolved.display()
+                )));
+            }
+
+            return Ok(resolved);
+        }
+
+        // Priority 2: CLI --config argument
+        if let Some(ref config_path) = self.config {
+            if !config_path.exists() {
+                return Err(Error::Config(format!(
+                    "Config file specified by --config not found: {}",
+                    config_path.display()
+                )));
+            }
+            return Ok(config_path.clone());
+        }
+
+        // Priority 3: Default config file
+        let default_path = PathBuf::from(DEFAULT_CONFIG_PATH);
+        if !default_path.exists() {
+            return Err(Error::Config(format!(
+                "Default config file not found: {}. Please specify config via scenario file or --config",
+                default_path.display()
+            )));
+        }
+
+        Ok(default_path)
     }
 
     /// Get the infrastructure config file path (uses default if not specified)

@@ -6,6 +6,7 @@
 use crate::driver::{Connection, ConnectionConfig, DatabaseDriver};
 use crate::{Error, Result};
 use deadpool::managed::{Manager, RecycleError, RecycleResult};
+use std::sync::atomic::Ordering;
 use std::sync::Arc;
 use std::time::Duration;
 use tracing::{debug, warn};
@@ -163,18 +164,24 @@ impl Manager for DriverManager {
         conn: &mut Self::Type,
         _metrics: &deadpool::managed::Metrics,
     ) -> RecycleResult<Self::Error> {
-        // Health check: ping the connection
-        match conn.ping().await {
+        // Health check: verify connection is still alive
+        let ping_result = conn.ping().await;
+
+        match ping_result {
             Ok(_) => {
-                // Connection is healthy
                 debug!("Connection health check passed, returning to pool");
                 Ok(())
             }
             Err(e) => {
-                // Connection is broken, discard it
-                // deadpool will create a new one
+                // Health check failed - connection is broken, will be discarded
+                static PING_FAIL_COUNT: std::sync::atomic::AtomicUsize = std::sync::atomic::AtomicUsize::new(0);
+                let fail_num = PING_FAIL_COUNT.fetch_add(1, Ordering::Relaxed) + 1;
+
+                eprintln!("[Pool] ⚠️  Health check FAILED #{}: {}", fail_num, e);
+
                 warn!(
                     error = %e,
+                    failure_count = fail_num,
                     "Connection health check failed, discarding connection"
                 );
                 Err(RecycleError::Backend(e))

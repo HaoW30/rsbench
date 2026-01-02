@@ -209,7 +209,7 @@ impl RuntimeEngine for AsyncRuntime {
         // 5. Record metrics
         self.metrics.record_operation(&op.name, duration, &result);
 
-        // 6. Return result
+        // 6. Return result and surface errors prominently
         match result {
             Ok(query_result) => Ok(OperationResult {
                 success: true,
@@ -217,12 +217,26 @@ impl RuntimeEngine for AsyncRuntime {
                 rows_affected: query_result.rows_affected,
                 error: None,
             }),
-            Err(e) => Ok(OperationResult {
-                success: false,
-                duration,
-                rows_affected: 0,
-                error: Some(e.to_string()),
-            }),
+            Err(e) => {
+                // Surface query errors prominently
+                static ERROR_COUNT: std::sync::atomic::AtomicUsize = std::sync::atomic::AtomicUsize::new(0);
+                let err_num = ERROR_COUNT.fetch_add(1, std::sync::atomic::Ordering::Relaxed) + 1;
+
+                // Log first 10 errors and every 1000th error
+                if err_num <= 10 || err_num % 1000 == 0 {
+                    eprintln!("\n⚠️  [Runtime] Query Error #{}: {}", err_num, e);
+                    eprintln!("    Operation: {}", op.name);
+                    eprintln!("    SQL: {}", op.sql);
+                    eprintln!("    Params: {:?}\n", op.params);
+                }
+
+                Ok(OperationResult {
+                    success: false,
+                    duration,
+                    rows_affected: 0,
+                    error: Some(e.to_string()),
+                })
+            }
         }
     }
 

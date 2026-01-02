@@ -21,6 +21,7 @@ pub mod pool;
 pub mod driver;
 pub mod metrics;
 pub mod scenario;
+pub mod event;
 pub mod cli;
 
 // Re-export commonly used types
@@ -32,6 +33,7 @@ pub use runtime::{RuntimeEngine, create_runtime};
 pub use metrics::{MetricsCollector, MetricsSnapshot};
 pub use scenario::ScenarioExecutor;
 pub use driver::DriverRegistry;
+pub use event::{EventManager, config::EventConfig};
 
 // Error types are already public via the enum definitions below
 
@@ -58,6 +60,9 @@ pub enum Error {
 
     #[error("Metrics error: {0}")]
     Metrics(String),
+
+    #[error("Event error: {0}")]
+    Event(String),
 
     #[error("IO error: {0}")]
     Io(#[from] std::io::Error),

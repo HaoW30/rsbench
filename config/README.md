@@ -5,49 +5,118 @@ This directory contains infrastructure configurations for RSBench.
 ## Purpose
 
 Infrastructure configs define **how to connect and run**:
-- Database connection settings
-- Connection pool configuration
-- Runtime settings (async/blocking, workers, etc.)
-- Output preferences
+- Database connection settings (host, port, credentials)
+- Connection pool configuration (min/max size, timeouts)
+- Runtime settings (workers, max_connections, backpressure)
+- Output preferences (format, file)
 
-They are separate from test scenarios (what to test), which are defined in `scenarios/`.
+They are **separate** from test scenarios (what to test), which are defined in `scenarios/`.
+
+## Architecture
+
+```
+Scenario → references → Config (this directory)
+```
+
+Example:
+```yaml
+# scenarios/my_test.yaml
+config: ../config/local.yaml  # References infrastructure config
+
+scenario:
+  executor:
+    type: constant-rate
+    rate: 1000
+    duration: 60s
+  workload:
+    file: ../workloads/oltp.yaml
+```
 
 ## Available Configs
 
-### `rsbench.config.yaml` (Default)
-Local development / default configuration.
+### Default / Development Configs
 
-**Connection**: `localhost:3306`
-**Use case**: Local testing, development
+- **`rsbench.config.yaml`** - Default config (localhost:3306)
+  - Use case: Local MySQL testing, development
+  - Connection: `localhost:3306`
 
-### `rsbench.config.staging.yaml`
-Staging environment configuration.
+- **`local.yaml`** - Simple local config (port 4000)
+  - Use case: Quick local testing with TiDB/MySQL on port 4000
+  - Connection: `127.0.0.1:4000`
 
-**Connection**: Staging database cluster
-**Use case**: Pre-production testing, QA validation
+### High-Throughput Configs
 
-### `rsbench.config.prod.yaml`
-Production environment configuration (read replica).
+- **`mysql_port4000.yaml`** - High connection pool (800 max)
+  - Use case: 100K QPS testing
+  - Connection: `localhost:4000`, max_connections: 1000
 
-**Connection**: Production read replica
-**Use case**: Production validation, capacity verification
-**⚠️ Caution**: Use conservative settings to avoid impacting production
+- **`mysql_port4000_20conn.yaml`** - Limited connections (20 max)
+  - Use case: Backpressure testing with minimal connections
+  - Connection: `localhost:4000`, max_connections: 20
 
-## Usage
+- **`mysql_50conn.yaml`** - 50 connections (pre-warmed)
+  - Use case: Moderate to high load testing (10K QPS)
+  - Connection: `127.0.0.1:4000`, max_connections: 50
 
-### Default Config
+- **`tidb_100k.yaml`** - Extreme throughput (200 connections)
+  - Use case: TiDB 100K QPS testing
+  - Connection: `localhost:4000`, max_connections: 200
 
-If no `--config` is specified, `config/rsbench.config.yaml` is used:
+### Environment Configs
 
-```bash
-rsbench --scenario scenarios/oltp_read_write.yaml
+- **`rsbench.config.staging.yaml`** - Staging environment
+  - Use case: Pre-production testing, QA validation
+  - Connection: `staging-db.example.com:3306`
+
+- **`rsbench.config.prod.yaml`** - Production environment (read replica)
+  - Use case: Production validation, capacity verification
+  - Connection: `prod-replica.example.com:3306`
+  - ⚠️ **Caution**: Use conservative settings
+
+## Usage Patterns
+
+### Pattern 1: Scenario References Config (Recommended)
+
+Scenario file specifies which config to use:
+
+```yaml
+# scenarios/my_test.yaml
+config: ../config/local.yaml
 ```
 
-### Explicit Config
+```bash
+rsbench --scenario scenarios/my_test.yaml run
+```
+
+✅ **Self-contained**: Config is explicit in scenario
+✅ **Version control**: Easy to track which config was used
+
+### Pattern 2: Override Config via CLI
+
+Override scenario's config for different environments:
 
 ```bash
-rsbench --config config/rsbench.config.staging.yaml --scenario scenarios/oltp_read_write.yaml
+# Development (uses scenario's config)
+rsbench --scenario scenarios/smoke_test.yaml run
+
+# Staging (override with staging config)
+rsbench --config config/staging.yaml --scenario scenarios/smoke_test.yaml run
+
+# Production (override with prod config)
+rsbench --config config/prod.yaml --scenario scenarios/smoke_test.yaml run
 ```
+
+✅ **Flexible**: Test same scenario across environments
+
+### Pattern 3: Default Config
+
+If scenario doesn't specify a config:
+
+```bash
+rsbench --scenario scenarios/my_test.yaml run
+```
+
+Uses `config/rsbench.config.yaml` by default.
 
 ### Config in Scenario File
 

@@ -28,9 +28,10 @@ RSBench is purpose-built for distributed SQL databases and cloud-native workload
 1. **Time Is the Primary Control Plane** - Load is defined by time and rate, not by threads
 2. **Backpressure Is a Signal, Not a Failure** - Client-side pressure is observable
 3. **The Client Must Never Lie** - Client limits are explicitly tracked
-4. **Database Workloads Are Stateful** - Model sessions, transactions, prepared statements
-5. **Test-as-Code Is the Default** - Workloads are version-controlled artifacts
-6. **Explicit Phases Instead of Implicit Behavior** - Phase boundaries are clear and deterministic
+4. **Errors Are Metrics, Not Failures** - Database errors are measured and reported, never hidden (see [Error Handling Philosophy](docs/error-handling-philosophy.md))
+5. **Database Workloads Are Stateful** - Model sessions, transactions, prepared statements
+6. **Test-as-Code Is the Default** - Workloads are version-controlled artifacts
+7. **Explicit Phases Instead of Implicit Behavior** - Phase boundaries are clear and deterministic
 
 ## Key Features
 
@@ -49,6 +50,62 @@ RSBench is purpose-built for distributed SQL databases and cloud-native workload
 - **Test-as-Code**: YAML/TOML workload definitions with Git versioning
 - **CI/CD Integration**: Thresholds and checks for automated regression detection
 - **Flexible Workloads**: Declarative YAML or programmable Lua scripts
+
+## Design Philosophy: Errors as Observability Data
+
+**RSBench treats database errors as metrics to measure, not failures to halt on.**
+
+This is a fundamental design difference from sysbench:
+
+```
+Sysbench: Stop on error by default → Add --ignore-errors to continue
+RSBench:  Count all errors by default → Add error_threshold to stop (optional)
+```
+
+### Why This Matters
+
+**Capacity Testing**: Errors reveal system limits
+```
+Rate: 5K QPS   → Errors: 0%    ✅ Within capacity
+Rate: 10K QPS  → Errors: 0.5%  ⚠️  Approaching limit
+Rate: 20K QPS  → Errors: 8%    ❌ Over capacity
+```
+If we stopped at the first error, we'd never find the capacity curve.
+
+**Failure Testing**: Modern systems test under failure, not just success
+```
+Time 0-60s:   Errors: 0%    (Normal operation)
+Time 60-90s:  Errors: 85%   (Database failover)  ← Measure this!
+Time 90-120s: Errors: 8%    (Recovery)           ← And this!
+```
+Stopping hides the failover duration and recovery behavior.
+
+**Real-World Behavior**: Production systems measure errors, they don't halt
+- Deadlocks at high concurrency? Measure the rate to set limits
+- Duplicate keys in race conditions? Expected - track frequency
+- Connection timeouts during upgrades? See impact and recovery time
+
+### What You Get
+
+RSBench provides **enhanced error visibility** instead of stopping:
+
+```
+Operation: point_select
+  Count: 10000
+  Errors: 150 (1.5%)           ← Error rate
+  Success Rate: 98.5%          ← Success rate
+
+⚠️  Warning: Error rate (1.5%) exceeds recommended threshold (1.0%)
+```
+
+**Optional error thresholds** (M1) for regression tests where errors are truly unexpected:
+```yaml
+error_handling:
+  threshold: 5.0    # Stop if > 5% error rate
+  action: stop      # or "warn"
+```
+
+See [Error Handling Philosophy](docs/error-handling-philosophy.md) for complete rationale and use cases.
 
 ## Getting Started
 
@@ -84,10 +141,49 @@ vim config/rsbench.config.yaml
 # Or use default (mysql://localhost/sbtest)
 ```
 
-**Step 3: Run your first benchmark**
+**Step 3: Prepare the database (create tables and load data)**
+
+RSBench requires a separate **prepare step** to set up the database before running benchmarks:
 
 ```bash
-# Quickstart: Simple 10-second test at 100 ops/sec
+# Prepare: Create tables and load initial test data
+./target/release/rsbench prepare workloads/oltp_read_write.yaml
+
+# What this does:
+# 1. Reads the workload schema definition (tables, columns, indexes)
+# 2. Creates tables (e.g., sbtest1, sbtest2, ..., sbtest10)
+# 3. Creates indexes as specified in the workload
+# 4. Loads initial test data (default: 10,000 rows per table)
+#
+# This is a ONE-TIME setup step. You only need to run it once
+# before your first benchmark, or when you want fresh data.
+```
+
+**What happens during prepare:**
+
+```sql
+-- Example: For oltp_read_write workload, this creates:
+CREATE TABLE IF NOT EXISTS sbtest1 (
+  id INT AUTO_INCREMENT PRIMARY KEY,
+  k INT,
+  c CHAR(120),
+  INDEX k_idx (k)
+);
+
+-- Loads 10,000 rows per table
+INSERT INTO sbtest1 (k, c) VALUES (...), (...), ...;  -- Batched inserts
+-- ... repeats for sbtest2, sbtest3, ..., sbtest10
+```
+
+**Note:** Prepare is intentionally a separate command (not automatic during `run`). This allows you to:
+- Prepare once, run many benchmarks without recreating data
+- Use different scenarios against the same dataset
+- Inspect/modify tables manually between prepare and run if needed
+
+**Step 4: Run your first benchmark**
+
+```bash
+# Now run the benchmark against the prepared tables
 ./target/release/rsbench \
   --config config/rsbench.config.yaml \
   --scenario scenarios/quickstart.yaml
@@ -96,11 +192,15 @@ vim config/rsbench.config.yaml
 # - Used config: mysql://localhost/sbtest (from config file)
 # - Used scenario: 100 ops/sec for 10 seconds (from quickstart.yaml)
 # - Used workload: oltp_read_write (referenced in scenario)
+# - Ran queries against the tables created in Step 3
 ```
 
-**Step 4: Try other scenarios**
+**Step 5: Try other scenarios**
 
 ```bash
+# All scenarios run against the same prepared tables
+# No need to run prepare again!
+
 # Smoke test (very quick validation)
 ./target/release/rsbench --scenario scenarios/smoke_test.yaml
 
@@ -114,7 +214,7 @@ vim config/rsbench.config.yaml
 ./target/release/rsbench --scenario scenarios/capacity_test.yaml
 ```
 
-**Step 5: Test different environments**
+**Step 6: Test different environments**
 
 ```bash
 # Development (default config)
@@ -135,6 +235,182 @@ rsbench --config config/rsbench.config.prod.yaml \
 - **Create scenarios**: See `scenarios/README.md` for different execution patterns
 - **Configure infrastructure**: See `config/README.md` for connection settings
 - **Advanced features**: See `docs/` for distributed testing, event integration, etc.
+
+## Database Preparation
+
+### Understanding the Prepare Step
+
+RSBench uses a **two-phase approach** for database testing:
+
+1. **Prepare Phase** (one-time): Create schema and load test data
+2. **Run Phase** (repeatable): Execute benchmark workload
+
+This separation provides several benefits:
+- **Efficiency**: Prepare once, run many benchmarks
+- **Reproducibility**: All tests use the same baseline data
+- **Flexibility**: Manually inspect or modify data between phases
+- **Control**: Choose when to reset data vs. accumulate changes
+
+### Running Prepare
+
+```bash
+# Basic usage
+rsbench prepare <workload_file>
+
+# Example
+rsbench prepare workloads/oltp_read_write.yaml
+```
+
+### What Prepare Does
+
+The prepare command performs these operations in order:
+
+**1. Load Workload Definition**
+```bash
+# Reads workload YAML file
+# Parses schema definitions (tables, columns, indexes, row counts)
+```
+
+**2. Connect to Database**
+```bash
+# Uses database connection from config/rsbench.config.yaml
+# Creates a single connection for DDL/DML operations
+```
+
+**3. Create Tables**
+```sql
+-- For each table in the workload schema:
+CREATE TABLE IF NOT EXISTS sbtest1 (
+  id INT AUTO_INCREMENT PRIMARY KEY,
+  k INT,
+  c CHAR(120),
+  INDEX k_idx (k)
+);
+
+-- Creates all indexes as specified
+CREATE INDEX k_idx ON sbtest1 (k);
+```
+
+**4. Load Test Data**
+```bash
+# Inserts initial rows based on row_count configuration
+# Uses batched inserts (1000 rows per batch) for performance
+# Default: 10,000 rows per table (configurable in workload YAML)
+```
+
+### Prepare Output Example
+
+```
+$ rsbench prepare workloads/oltp_read_write.yaml
+
+Preparing workload from: workloads/oltp_read_write.yaml
+Connecting to database: mysql://localhost:3306/sbtest
+Loading workload definition...
+Creating tables and loading data...
+Loading 10000 rows into table sbtest1 using uniform strategy...
+Loading 10000 rows into table sbtest2 using uniform strategy...
+Loading 10000 rows into table sbtest3 using uniform strategy...
+...
+Loading 10000 rows into table sbtest10 using uniform strategy...
+✓ Workload preparation completed successfully!
+```
+
+### Customizing Data Volume
+
+You can control the amount of test data by modifying the workload file:
+
+```yaml
+# workloads/my_custom_workload.yaml
+workload:
+  name: my_test
+  schema:
+    tables:
+      - name: sbtest
+        count: 20              # Create 20 tables instead of 10
+        row_count: 100000      # Load 100k rows instead of 10k
+        columns:
+          - name: id
+            type: INT
+            primary_key: true
+          - name: k
+            type: INT
+            index: k_idx
+          - name: c
+            type: CHAR(120)
+```
+
+Then prepare with your custom settings:
+```bash
+rsbench prepare workloads/my_custom_workload.yaml
+```
+
+### When to Re-run Prepare
+
+You need to run prepare again when:
+- **First-time setup**: Initial database setup
+- **Schema changes**: Modified workload table/column definitions
+- **Data reset**: Want to start with fresh baseline data
+- **Different workload**: Switching to a workload with different schema
+
+You do NOT need to re-run prepare when:
+- Running different scenarios against the same workload
+- Testing different rates/durations
+- Running on different database environments (each environment prepares independently)
+
+### Typical Workflow
+
+```bash
+# 1. PREPARE ONCE: Set up database schema and data
+rsbench prepare workloads/oltp_read_write.yaml
+
+# 2. RUN MANY TIMES: Execute different benchmark scenarios
+rsbench run scenarios/smoke_test.yaml        # Quick validation
+rsbench run scenarios/oltp_read_write.yaml   # Standard test
+rsbench run scenarios/high_throughput.yaml   # Find limits
+
+# 3. OPTIONAL: Inspect data manually
+mysql -u root sbtest -e "SELECT COUNT(*) FROM sbtest1;"
+
+# 4. RESET: Re-run prepare when you want fresh data
+rsbench prepare workloads/oltp_read_write.yaml  # Recreates tables
+```
+
+### PrepareContext Details
+
+For workload developers, the `prepare()` method receives a `PrepareContext`:
+
+```rust
+pub struct PrepareContext<'a> {
+    /// Database connection for DDL/DML operations
+    pub connection: &'a mut dyn Connection,
+
+    /// Determinism seed (for reproducible data generation)
+    pub seed: u64,
+
+    /// Number of workers (for data partitioning in distributed mode)
+    pub worker_count: usize,
+}
+```
+
+This context provides:
+- **connection**: Execute CREATE TABLE, INSERT, CREATE INDEX statements
+- **seed**: Generate deterministic test data (same seed = same data)
+- **worker_count**: Partition data across workers in distributed scenarios (M1+)
+
+### Cleanup (Manual)
+
+Currently (M0), cleanup is manual:
+
+```sql
+-- To remove tables after testing
+DROP TABLE IF EXISTS sbtest1, sbtest2, sbtest3, ..., sbtest10;
+
+-- Or drop the entire database
+DROP DATABASE sbtest;
+CREATE DATABASE sbtest;
+```
+
+**Note:** Automatic cleanup via `rsbench cleanup` command is planned for M1.
 
 ### Customizing Workloads
 
@@ -294,6 +570,7 @@ Monitoring integrations, web interface, and industry-standard benchmark suites
 | I/O Model | Blocking | Async (non-blocking) |
 | Coordinated Omission | Yes (latency skew) | No (accurate) |
 | Backpressure | Hidden | Visible (explicit metric) |
+| **Error Handling** | **Stop by default, opt-in ignore** | **Count all errors, opt-in stop** |
 | Determinism | Limited | Full (seeded RNG) |
 | Multi-Region | No | Yes (M1+) |
 | Test-as-Code | No | Yes (YAML/TOML) |
@@ -305,6 +582,7 @@ Monitoring integrations, web interface, and industry-standard benchmark suites
 | Sysbench Compatibility | N/A | 100% (command mapping in docs) |
 | `--threads=N` | N OS threads | `workers: N` (N async tasks) |
 | `--rate=X` | Not supported | `rate: X` (open-loop executor) |
+| `--ignore-errors` | Required for error tolerance | Not needed (errors are metrics) |
 
 ## Contributing
 

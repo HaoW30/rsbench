@@ -1,0 +1,31 @@
+# 10K QPS Test - 50 Connections
+#
+# Tests 10K operations per second with 50 connections
+# Good for moderate high-throughput scenarios
+
+# Infrastructure configuration
+config: ../config/test/mysql_50conn.yaml
+
+scenario:
+  executor:
+    type: constant-rate
+    rate: 10000           # Target: 10K ops/sec
+    duration: 15s         # Short test
+    max_connections: 50   # 50 concurrent operations
+
+  workload:
+    type: declarative
+    file: ../workloads/oltp_point_select.yaml
+    overrides:
+      schema:
+        tables:
+          - count: 10
+            row_count: 100000
+
+determinism:
+  seed: 42
+  strict_mode: false
+
+output:
+  format: text
+  file: null

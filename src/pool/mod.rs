@@ -234,7 +234,8 @@ use deadpool::Runtime;
 use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::Arc;
 use std::time::Duration;
-use tracing::{debug, info, warn, error};
+use tokio::sync::{Semaphore, OwnedSemaphorePermit};
+use tracing::{debug, error, info, warn};
 
 /// Connection pool with real pooling via deadpool
 ///
@@ -293,6 +294,12 @@ pub struct ConnectionPool {
 
     /// Configuration for reference and stats
     config: PoolConfig,
+
+    /// Semaphore to strictly enforce max_size limit
+    /// This ensures we never create more than max_size connections,
+    /// even under high concurrent load where deadpool might attempt
+    /// to create extra connections
+    connection_limiter: Arc<Semaphore>,
 
     /// Health metrics - total successful checkouts
     total_checkouts: Arc<AtomicUsize>,
@@ -375,9 +382,13 @@ impl ConnectionPool {
                 ))
             })?;
 
+        // Create semaphore with max_size permits to strictly enforce connection limit
+        let connection_limiter = Arc::new(Semaphore::new(config.max_size));
+
         let pool = Self {
             inner,
             config,
+            connection_limiter,
             total_checkouts: Arc::new(AtomicUsize::new(0)),
             connection_errors: Arc::new(AtomicUsize::new(0)),
         };
@@ -386,7 +397,7 @@ impl ConnectionPool {
             max_size = pool.config.max_size,
             min_size = pool.config.min_size,
             connection_timeout_ms = pool.config.connection_timeout.as_millis(),
-            "Connection pool created"
+            "Connection pool created with strict semaphore enforcement"
         );
 
         Ok(pool)
@@ -417,15 +428,19 @@ impl ConnectionPool {
     /// # }
     /// ```
     pub async fn warm_up(&self) -> Result<()> {
+        info!("Pool warm-up: pre-creating {} connections", self.config.min_size);
+
         // Pre-create min_size connections by checking them out and immediately returning them
         let mut connections = Vec::new();
 
         for _ in 0..self.config.min_size {
             match self.get().await {
-                Ok(conn) => connections.push(conn),
+                Ok(conn) => {
+                    connections.push(conn);
+                }
                 Err(e) => {
                     // Failed to create a connection during warm-up
-                    // Drop any connections we did create and return the error
+                    error!("Pool warm-up failed: {}", e);
                     return Err(e);
                 }
             }
@@ -433,6 +448,8 @@ impl ConnectionPool {
 
         // Connections are automatically returned to the pool when dropped
         drop(connections);
+
+        info!("Pool warm-up completed: {} connections ready", self.config.min_size);
 
         Ok(())
     }
@@ -472,7 +489,23 @@ impl ConnectionPool {
     /// # }
     /// ```
     pub async fn get(&self) -> Result<PooledConnection> {
-        // Get connection from deadpool with timeout
+        // CRITICAL: Acquire semaphore permit FIRST to strictly enforce max_size
+        // This prevents deadpool from creating more than max_size connections
+        // even under high concurrent load
+        let permit = self
+            .connection_limiter
+            .clone()
+            .acquire_owned()
+            .await
+            .map_err(|e| {
+                crate::Error::Pool(crate::PoolError::Unknown(format!(
+                    "Semaphore acquisition failed: {}",
+                    e
+                )))
+            })?;
+
+        // Now get connection from deadpool
+        // With semaphore in place, at most max_size concurrent get() calls can proceed
         let result = self
             .inner
             .get()
@@ -489,8 +522,8 @@ impl ConnectionPool {
             });
 
         // Track metrics and log events
-        match &result {
-            Ok(_) => {
+        match result {
+            Ok(conn) => {
                 // Successful checkout
                 let checkout_count = self.total_checkouts.fetch_add(1, Ordering::Relaxed) + 1;
                 debug!(
@@ -498,9 +531,18 @@ impl ConnectionPool {
                     active = self.inner.status().size - self.inner.status().available,
                     "Connection checked out from pool"
                 );
+
+                // Success - wrap connection with permit
+                // Permit is held until PooledConnection is dropped
+                Ok(PooledConnection {
+                    inner: conn,
+                    _permit: permit,
+                })
             }
             Err(e) => {
-                // Connection error
+                // Connection error - release permit since we didn't get a connection
+                drop(permit);
+
                 let error_count = self.connection_errors.fetch_add(1, Ordering::Relaxed) + 1;
                 error!(
                     error_count,
@@ -518,10 +560,10 @@ impl ConnectionPool {
                         "Pool saturation detected - requests waiting for connections"
                     );
                 }
+
+                Err(e)
             }
         }
-
-        result.map(|conn| PooledConnection { inner: conn })
     }
 
     /// Get pool statistics
@@ -613,6 +655,15 @@ pub struct PooledConnection {
     ///
     /// This wraps our `Box<dyn Connection>` and handles returning it to the pool on drop
     inner: deadpool::managed::Object<DriverManager>,
+
+    /// Semaphore permit that enforces max_size limit
+    ///
+    /// This permit is held for the lifetime of this PooledConnection.
+    /// When the connection is dropped, the permit is automatically released,
+    /// allowing another caller to acquire it and create/checkout a connection.
+    ///
+    /// This ensures we NEVER exceed max_size connections, even under high concurrency.
+    _permit: OwnedSemaphorePermit,
 }
 
 impl PooledConnection {

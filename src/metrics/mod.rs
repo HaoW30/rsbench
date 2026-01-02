@@ -19,6 +19,8 @@ use std::time::{Duration, Instant, SystemTime};
 pub struct MetricsCollector {
     operation_metrics: DashMap<String, OperationMetrics>,
     backpressure_events: AtomicU64,
+    pool_saturation_events: AtomicU64,
+    runtime_saturation_events: AtomicU64,
     start_time: Instant,
 }
 
@@ -27,6 +29,8 @@ impl MetricsCollector {
         Arc::new(Self {
             operation_metrics: DashMap::new(),
             backpressure_events: AtomicU64::new(0),
+            pool_saturation_events: AtomicU64::new(0),
+            runtime_saturation_events: AtomicU64::new(0),
             start_time: Instant::now(),
         })
     }
@@ -62,6 +66,16 @@ impl MetricsCollector {
         self.backpressure_events.fetch_add(1, Ordering::Relaxed);
     }
 
+    /// Record pool saturation event
+    pub fn record_pool_saturation(&self) {
+        self.pool_saturation_events.fetch_add(1, Ordering::Relaxed);
+    }
+
+    /// Record runtime saturation event
+    pub fn record_runtime_saturation(&self) {
+        self.runtime_saturation_events.fetch_add(1, Ordering::Relaxed);
+    }
+
     /// Get snapshot of all metrics
     pub fn snapshot(&self) -> MetricsSnapshot {
         let mut operation_metrics = HashMap::new();
@@ -83,6 +97,8 @@ impl MetricsCollector {
         MetricsSnapshot {
             operation_metrics,
             backpressure_events: self.backpressure_events.load(Ordering::Relaxed),
+            pool_saturation_events: self.pool_saturation_events.load(Ordering::Relaxed),
+            runtime_saturation_events: self.runtime_saturation_events.load(Ordering::Relaxed),
             duration: self.start_time.elapsed(),
             timestamp: SystemTime::now(),
         }
@@ -112,6 +128,8 @@ impl OperationMetrics {
 pub struct MetricsSnapshot {
     pub operation_metrics: HashMap<String, OperationMetricsSnapshot>,
     pub backpressure_events: u64,
+    pub pool_saturation_events: u64,
+    pub runtime_saturation_events: u64,
     pub duration: Duration,
     pub timestamp: SystemTime,
 }
@@ -129,6 +147,14 @@ impl OperationMetricsSnapshot {
             0.0
         } else {
             (self.count - self.errors) as f64 / self.count as f64
+        }
+    }
+
+    pub fn error_rate(&self) -> f64 {
+        if self.count == 0 {
+            0.0
+        } else {
+            self.errors as f64 / self.count as f64
         }
     }
 
@@ -241,6 +267,29 @@ mod tests {
         };
 
         assert_eq!(metrics.success_rate(), 0.0);
+    }
+
+    #[test]
+    fn test_error_rate_calculation() {
+        let metrics = OperationMetricsSnapshot {
+            count: 100,
+            errors: 5,
+            latency_histogram: Histogram::new(3).unwrap(),
+        };
+
+        let error_rate = metrics.error_rate();
+        assert!((error_rate - 0.05).abs() < f64::EPSILON);
+    }
+
+    #[test]
+    fn test_error_rate_zero_count() {
+        let metrics = OperationMetricsSnapshot {
+            count: 0,
+            errors: 0,
+            latency_histogram: Histogram::new(3).unwrap(),
+        };
+
+        assert_eq!(metrics.error_rate(), 0.0);
     }
 
     #[test]

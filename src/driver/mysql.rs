@@ -34,13 +34,12 @@ impl DatabaseDriver for MySqlDriver {
 
     async fn connect(&self, config: &ConnectionConfig) -> Result<Box<dyn Connection + Send>> {
         let opts = mysql_async::Opts::from_url(&config.connection_string)
-            .map_err(|e| DatabaseError::Connection(e.to_string()))?;
+            .map_err(|e| DatabaseError::Connection(format!("URL parse error: {}", e)))?;
 
         // ✅ Create connection directly (no pool)
         // This is the correct approach - pooling happens in ConnectionPool module
-        let conn = Conn::new(opts)
-            .await
-            .map_err(|e| DatabaseError::Connection(e.to_string()))?;
+        let conn = Conn::new(opts).await
+            .map_err(|e| DatabaseError::Connection(format!("MySQL connect error: {}", e)))?;
 
         Ok(Box::new(MySqlConnection { conn }))
     }
@@ -63,10 +62,42 @@ impl Connection for MySqlConnection {
     async fn execute(&mut self, sql: &str, params: &[Value]) -> Result<QueryResult> {
         let mysql_params = convert_params(params);
 
-        self.conn
-            .exec_drop(sql, mysql_params)
-            .await
-            .map_err(|e| DatabaseError::Query(e.to_string()))?;
+        // Execute query and capture result
+        let result = self.conn.exec_drop(sql, mysql_params).await;
+
+        match &result {
+            Ok(_) => {
+                // Success - no logging needed
+            }
+            Err(e) => {
+                // Error - classify and handle based on error type
+                static ERR_COUNT: std::sync::atomic::AtomicUsize = std::sync::atomic::AtomicUsize::new(0);
+                let err_num = ERR_COUNT.fetch_add(1, std::sync::atomic::Ordering::Relaxed) + 1;
+
+                // Only log first few errors to avoid spam (runtime will also log)
+                if err_num <= 5 {
+                    eprintln!("[MySQL] Query ERROR #{}: {}", err_num, e);
+                    eprintln!("[MySQL]   SQL: {}", sql);
+                    eprintln!("[MySQL]   Params: {:?}", params);
+                    eprintln!("[MySQL]   Error details: {:?}", e);
+                }
+
+                // Try to recover connection state after query errors
+                // This attempts to clear any partial state that might corrupt the connection
+                // For most query errors (syntax, param mismatch, constraint violations),
+                // the connection should remain usable
+                if is_recoverable_error(&e) {
+                    // For recoverable errors, the connection should still be valid
+                    // No action needed - just return the error
+                } else {
+                    // For non-recoverable errors (I/O errors, connection closed),
+                    // the connection is likely broken and will fail ping() on recycle
+                    eprintln!("[MySQL] Non-recoverable error detected - connection may be broken");
+                }
+            }
+        }
+
+        result.map_err(|e| DatabaseError::Query(e.to_string()))?;
 
         Ok(QueryResult {
             rows_affected: self.conn.affected_rows(),
@@ -104,6 +135,28 @@ impl Connection for MySqlConnection {
             .await
             .map_err(|e| DatabaseError::Connection(e.to_string()))?;
         Ok(())
+    }
+}
+
+/// Classify whether an error is recoverable (connection remains valid)
+/// vs non-recoverable (connection is broken)
+fn is_recoverable_error(e: &mysql_async::Error) -> bool {
+    use mysql_async::Error;
+
+    match e {
+        // Driver errors (parameter mismatch, etc.) are recoverable
+        // The query never reaches the server, connection is still valid
+        Error::Driver(_) => true,
+
+        // Server errors (SQL syntax, constraint violations, etc.) are recoverable
+        // The server processed the query and returned an error, but connection is fine
+        Error::Server(_) => true,
+
+        // I/O errors mean the connection is broken
+        Error::Io(_) => false,
+
+        // Other errors - treat as non-recoverable to be safe
+        _ => false,
     }
 }
 

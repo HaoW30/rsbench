@@ -4,15 +4,11 @@
 # Typical OLTP application pattern.
 #
 # Usage:
-#   rsbench --scenario scenarios/oltp_read_write.yaml
-#   rsbench --config config/staging.yaml --scenario scenarios/oltp_read_write.yaml
+#   rsbench --scenario scenarios/oltp_read_write.yaml run
 
-# Optional: Override default infrastructure config
-# config: config/rsbench.config.staging.yaml
+# Infrastructure configuration (database, pool, runtime)
+config: ../config/rsbench.config.yaml
 
-# ============================================================================
-# Test Scenario Definition
-# ============================================================================
 scenario:
   # Executor: How to apply load
   executor:
